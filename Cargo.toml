@@ -14,7 +14,7 @@ walkdir = "2"
 scraper = "0.24"
 rfd = "0.15"
 dirs = "6"
-similar = "2"
+similar = "3"
 tempfile = "3"
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
