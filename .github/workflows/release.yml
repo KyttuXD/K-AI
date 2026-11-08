@@ -54,7 +54,7 @@ jobs:
           bash scripts/package.sh
           # zip -y keeps symlinks inside the macOS .app bundle intact.
           (cd dist && zip -qry "../kyttu-ai-${TAG}-${{ matrix.artifact }}.zip" .)
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.artifact }}
           path: kyttu-ai-*.zip
