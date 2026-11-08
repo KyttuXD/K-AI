@@ -72,7 +72,7 @@ jobs:
           merge-multiple: true
       - name: Checksums
         run: sha256sum kyttu-ai-*.zip > SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           generate_release_notes: true
