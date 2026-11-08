@@ -3,6 +3,34 @@ use anyhow::{Context, Result, ensure};
 use scraper::{Html, Selector};
 use std::{io::Read, time::Duration};
 
+/// Generic User-Agent: no app name or version that would identify this install.
+pub const USER_AGENT: &str = "Mozilla/5.0 (compatible; kyttu-ai)";
+const QUERY_CHARS: usize = 120;
+
+/// A short search query from a chat question: code blocks dropped, whitespace
+/// collapsed, cut at a word boundary. Callers should still show it for review.
+pub fn query_from(question: &str) -> String {
+    let mut in_code = false;
+    let text = question
+        .lines()
+        .filter(|line| {
+            let fence = line.trim_start().starts_with("```");
+            in_code ^= fence;
+            !fence && !in_code
+        })
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.chars().count() <= QUERY_CHARS {
+        return text;
+    }
+    let cut: String = text.chars().take(QUERY_CHARS).collect();
+    match cut.rfind(' ') {
+        Some(space) if space > QUERY_CHARS / 2 => cut[..space].to_owned(),
+        _ => cut,
+    }
+}
+
 pub fn search(query: &str) -> Result<Vec<Source>> {
     ensure!(
         !query.trim().is_empty() && query.len() <= 1000,
@@ -10,7 +38,7 @@ pub fn search(query: &str) -> Result<Vec<Source>> {
     );
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
-        .user_agent("KYTTU-AI/0.2 (local desktop assistant)")
+        .user_agent(USER_AGENT)
         .build()?;
     let response = client
         .get("https://html.duckduckgo.com/html/")
@@ -90,5 +118,15 @@ mod tests {
         assert!(sources[0].text.contains("Useful & current"));
         assert!(normalize_url("javascript:alert(1)").is_none());
         Ok(())
+    }
+    #[test]
+    fn query_drops_code_and_stays_short() {
+        assert_eq!(
+            query_from("Why does\n```rust\nlet x = 1;\n```\nthis   fail?"),
+            "Why does this fail?"
+        );
+        let long = query_from(&"word ".repeat(100));
+        assert!(long.len() <= QUERY_CHARS && long.ends_with("word"));
+        assert!(!USER_AGENT.to_lowercase().contains("0.2"));
     }
 }

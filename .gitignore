@@ -11,3 +11,7 @@ rustc-ice-*.txt
 # Local model files and runtime logs
 *.gguf
 llama-server.log
+/target-pass
+
+# llama-server download/build cache (scripts/package.*, CI)
+/.llama

@@ -8,6 +8,8 @@ pub struct Persona {
     pub avatar_url: String,
     pub model: String,
     pub in_group: bool,
+    /// "Available on Discord": only these characters answer in Discord bots.
+    pub discord: bool,
 }
 impl Default for Persona {
     fn default() -> Self {
@@ -18,6 +20,7 @@ impl Default for Persona {
             avatar_url: String::new(),
             model: String::new(),
             in_group: true,
+            discord: false,
         }
     }
 }
@@ -45,4 +48,15 @@ pub fn validate(personas: &[Persona]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn discord_flag_defaults_off_for_old_files() {
+        let p: Persona = serde_json::from_str(r#"{"name":"Old"}"#).unwrap();
+        assert!(!p.discord && p.in_group);
+        assert!(validate(&[p]).is_ok());
+    }
 }

@@ -1,6 +1,9 @@
 pub mod config;
+pub mod diagnostics;
 pub mod engine;
 pub mod llama;
 pub mod personas;
 pub mod provider;
+pub mod setup;
 pub mod tools;
+pub mod update;

@@ -7,7 +7,11 @@ updates:
     groups:
       cargo-minor:
         update-types: [minor, patch]
+  # Actions are pinned to commit SHAs with a version comment; Dependabot bumps both.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    groups:
+      actions:
+        patterns: ['*']

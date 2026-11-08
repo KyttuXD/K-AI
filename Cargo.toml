@@ -2,10 +2,11 @@
 name = "kyttu-ai"
 version = "0.2.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 anyhow = "1"
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+eframe = { version = "0.33", default-features = false, features = ["accesskit", "default_fonts", "glow", "x11", "wayland"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -18,3 +19,22 @@ similar = "2"
 tempfile = "3"
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+# Published builds (release.yml, scripts/package.*): smaller and faster, at the cost of a slower final link.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# CI builds (build.yml): `cargo test --profile ci` and the test packages from `cargo build --profile ci` share one build
+# of the dependencies, so each run compiles them once (and not at all on a warm cache). The app crate is barely
+# optimised (it is rebuilt every run); dependencies are, so the uploaded test builds stay responsive. Line tables keep
+# file and line in crash.log backtraces without full debug info.
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 2

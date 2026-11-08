@@ -1,0 +1,6 @@
+# Pins the Rust toolchain for local builds and CI, so a new stable release does not invalidate every cache at once.
+# Bump it deliberately; CI installs whatever this file names.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
