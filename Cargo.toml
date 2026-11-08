@@ -1,0 +1,20 @@
+[package]
+name = "kyttu-ai"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+walkdir = "2"
+scraper = "0.24"
+rfd = "0.15"
+dirs = "6"
+similar = "2"
+tempfile = "3"
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
