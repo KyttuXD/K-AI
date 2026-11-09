@@ -376,8 +376,8 @@ impl Library {
                     Indexed {
                         name: r.get(1)?,
                         root: r.get(2)?,
-                        files: r.get(3)?,
-                        chunks: r.get(4)?,
+                        files: r.get::<_, i64>(3)? as usize,
+                        chunks: r.get::<_, i64>(4)? as usize,
                     },
                 ))
             })?
@@ -587,7 +587,7 @@ impl Library {
                     (
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
-                        r.get::<_, usize>(3)?,
+                        r.get::<_, i64>(3)? as usize,
                     ),
                 ))
             })?;
@@ -736,14 +736,14 @@ impl Library {
                         "INSERT INTO passage_files(id,source,path) VALUES(last_insert_rowid(),?1,?2)",
                     )?;
                     for c in &chunks {
-                        insert.execute(params![src.id, shown, c.line, c.section, c.text])?;
+                        insert.execute(params![src.id, shown, c.line as i64, c.section, c.text])?;
                         link.execute(params![src.id, shown])?;
                     }
                 }
                 conn.prepare_cached(
                     "INSERT OR REPLACE INTO files(source,path,size,mtime,chunks) VALUES(?1,?2,?3,?4,?5)",
                 )?
-                .execute(params![src.id, relative, size, mtime, chunks.len()])?;
+                .execute(params![src.id, relative, size, mtime, chunks.len() as i64])?;
                 updated += 1;
                 in_batch += 1;
                 {
@@ -806,7 +806,7 @@ impl Library {
                     let text: String = r.get(3)?;
                     Ok(Source {
                         path: r.get(0)?,
-                        line: r.get(1)?,
+                        line: r.get::<_, i64>(1)? as usize,
                         text: if section.is_empty() {
                             text
                         } else {
