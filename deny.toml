@@ -17,7 +17,14 @@ yanked = "deny"
 # by the weekly run's log and fixed through the dependency that pulls them in.
 unmaintained = "workspace"
 # Add an advisory here only with a comment saying why it does not affect this app and when to drop it.
-ignore = []
+ignore = [
+    # Drop when hpke-rs (via songbird's DAVE support) moves to libcrux-sha3 >= 0.0.10.
+    { id = "RUSTSEC-2026-0207", reason = "libcrux-sha3 pinned by hpke-rs via songbird DAVE; incremental SHAKE squeeze unused" },
+    # Drop with RUSTSEC-2026-0207 above (same crate, same fix).
+    { id = "RUSTSEC-2026-0208", reason = "libcrux-sha3 pinned by hpke-rs via songbird DAVE; AVX2 x4 shake256 unused" },
+    # Drop when songbird allows ringbuf >= 0.5.2.
+    { id = "RUSTSEC-2026-0293", reason = "songbird 0.6.1 needs ringbuf ^0.4; buffered samples have no panicking Drop" },
+]
 
 [licenses]
 version = 2

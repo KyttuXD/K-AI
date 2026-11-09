@@ -75,17 +75,68 @@ fn uses_ollama(config: &Config) -> bool {
     config.embedding_backend.eq_ignore_ascii_case("ollama")
 }
 
-/// Cache key of the model that produced a vector.
-fn cache_model(config: &Config) -> String {
-    if uses_ollama(config) {
-        return config.embedding_model.clone();
-    }
-    let name = llama::embed_model_path(config)
+/// The GGUF file name the llama.cpp backend embeds with (the default when none
+/// is installed yet).
+fn gguf_name(config: &Config) -> String {
+    llama::embed_model_path(config)
         .as_deref()
         .and_then(Path::file_name)
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| setup::EMBED_MODEL.file.into());
-    format!("gguf:{name}")
+        .unwrap_or_else(|| setup::EMBED_MODEL.file.into())
+}
+
+/// Cache key of the backend and model that produced a vector ("ollama:<tag>"
+/// or "gguf:<file>"), so switching either never mixes vectors.
+fn cache_model(config: &Config) -> String {
+    if uses_ollama(config) {
+        return format!("ollama:{}", config.embedding_model.trim());
+    }
+    format!("gguf:{}", gguf_name(config))
+}
+
+/// How a model wants its inputs marked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prompting {
+    /// nomic-embed-text: "search_query: " and "search_document: " (also the
+    /// fallback for unknown models, as before).
+    Nomic,
+    /// Qwen3-Embedding: an instruction on the query only, passages as they are.
+    Qwen3,
+}
+
+const QWEN3_QUERY: &str = "Instruct: Given a search query, retrieve relevant passages\nQuery: ";
+
+/// The prompting of a model, from its GGUF file name or Ollama tag.
+fn prompting_for(model: &str) -> Prompting {
+    if model.to_lowercase().contains("qwen3-embedding") {
+        Prompting::Qwen3
+    } else {
+        Prompting::Nomic
+    }
+}
+
+fn prompting(config: &Config) -> Prompting {
+    if uses_ollama(config) {
+        prompting_for(&config.embedding_model)
+    } else {
+        prompting_for(&gguf_name(config))
+    }
+}
+
+impl Prompting {
+    fn query(self, query: &str) -> String {
+        match self {
+            Self::Nomic => format!("search_query: {query}"),
+            Self::Qwen3 => format!("{QWEN3_QUERY}{query}"),
+        }
+    }
+
+    fn passage(self, text: &str) -> String {
+        match self {
+            Self::Nomic => format!("search_document: {text}"),
+            Self::Qwen3 => text.to_string(),
+        }
+    }
 }
 
 /// Embeds `text` with the configured backend: "ollama", or llama.cpp otherwise
@@ -139,6 +190,169 @@ fn embed_ollama(model: &str, text: &[String]) -> Result<Vec<Vec<f32>>, EmbedErro
     let value = read_response(response, model)?;
     serde_json::from_value(value["embeddings"].clone())
         .map_err(|e| EmbedError::Invalid(e.to_string()))
+}
+
+/// Client for `ollama pull`: no total timeout (a model is gigabytes).
+fn pull_client() -> Result<Client> {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    llama::shared(&CLIENT, || {
+        Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(None::<Duration>)
+            .build()
+    })
+}
+
+/// One line of Ollama's streamed /api/pull answer.
+#[derive(Debug, PartialEq)]
+enum PullLine {
+    Progress {
+        status: String,
+        done: u64,
+        total: u64,
+    },
+    Success,
+    Failed(String),
+}
+
+fn parse_pull_line(line: &str) -> Option<PullLine> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if let Some(error) = v["error"].as_str() {
+        return Some(PullLine::Failed(error.to_string()));
+    }
+    let status = v["status"].as_str()?.to_string();
+    if status == "success" {
+        return Some(PullLine::Success);
+    }
+    Some(PullLine::Progress {
+        status,
+        done: v["completed"].as_u64().unwrap_or(0),
+        total: v["total"].as_u64().unwrap_or(0),
+    })
+}
+
+/// Pulls an Ollama model (`ollama pull <tag>`) through POST {OLLAMA}/api/pull,
+/// streaming its progress into `progress` (stage, done, total). Blocking: run
+/// it on a worker thread; `cancel` stops it (Ollama resumes the download next
+/// time). `progress.finished` is set at the end, with `error` on failure.
+pub fn ollama_pull(
+    tag: &str,
+    progress: std::sync::Arc<Mutex<setup::SetupProgress>>,
+    cancel: std::sync::Arc<AtomicBool>,
+) -> Result<()> {
+    let result = run_pull(tag, &progress, &cancel);
+    let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
+    p.finished = true;
+    match &result {
+        Ok(()) => {
+            p.stage = format!("Installed {tag}");
+            p.done = p.total;
+        }
+        Err(e) => p.error = Some(format!("{e:#}")),
+    }
+    result
+}
+
+fn run_pull(tag: &str, progress: &Mutex<setup::SetupProgress>, cancel: &AtomicBool) -> Result<()> {
+    use std::io::BufRead;
+    let tag = tag.trim();
+    anyhow::ensure!(
+        !tag.is_empty() && !tag.chars().any(char::is_whitespace),
+        "Not an Ollama model name: {tag:?}"
+    );
+    {
+        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
+        p.stage = format!("Pulling {tag}");
+        (p.done, p.total) = (0, 0);
+    }
+    let response = pull_client()?
+        .post(format!("{}/api/pull", engine::OLLAMA))
+        .json(&json!({"model": tag, "stream": true}))
+        .send()
+        .map_err(|e| anyhow::anyhow!("Ollama is not running ({e})"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body: String = response
+            .text()
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
+        anyhow::bail!(
+            "Ollama refused to pull {tag} (HTTP {status}): {}",
+            body.trim()
+        );
+    }
+    for line in std::io::BufReader::new(response).lines() {
+        anyhow::ensure!(!cancel.load(Ordering::Relaxed), "Cancelled");
+        let line = line.map_err(|e| anyhow::anyhow!("Pull of {tag} interrupted ({e})"))?;
+        match parse_pull_line(&line) {
+            Some(PullLine::Success) => return Ok(()),
+            Some(PullLine::Failed(e)) => anyhow::bail!("Ollama could not pull {tag}: {e}"),
+            Some(PullLine::Progress {
+                status,
+                done,
+                total,
+            }) => {
+                let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
+                p.stage = format!("{tag}: {status}");
+                (p.done, p.total) = (done, total);
+            }
+            None => {}
+        }
+    }
+    anyhow::bail!("Ollama stopped before {tag} was pulled")
+}
+
+/// Ollama names are equal with or without the ":latest" tag.
+fn same_ollama_model(a: &str, b: &str) -> bool {
+    let plain = |t: &str| {
+        let t = t.trim().to_ascii_lowercase();
+        t.strip_suffix(":latest").map(str::to_string).unwrap_or(t)
+    };
+    plain(a) == plain(b)
+}
+
+/// True when Ollama has `tag` installed (GET /api/tags). Blocking, short
+/// timeout; false when Ollama is not running.
+// The UI reads its cached Ollama list instead; this one is for worker threads.
+#[allow(dead_code)]
+pub fn ollama_has_model(tag: &str) -> bool {
+    let Ok(client) = client() else {
+        return false;
+    };
+    client
+        .get(format!("{}/api/tags", engine::OLLAMA))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.json::<Value>().ok())
+        .is_some_and(|v| lists_ollama_model(&v, tag))
+}
+
+fn lists_ollama_model(tags: &Value, tag: &str) -> bool {
+    tags["models"].as_array().is_some_and(|models| {
+        models.iter().any(|m| {
+            ["name", "model"]
+                .iter()
+                .filter_map(|k| m[*k].as_str())
+                .any(|name| same_ollama_model(name, tag))
+        })
+    })
+}
+
+/// Whether Embedding rerank should switch itself on: the user never toggled
+/// it (`user_set` is config.rerank_user_set), it is off, an embedding model is
+/// ready (`model_ready`: llama::embed_model_path(config).is_some() for the
+/// llama backend, ollama_has_model(&config.embedding_model) for Ollama), and
+/// at least one documentation source is enabled.
+pub fn should_auto_enable(config: &Config, user_set: bool, model_ready: bool) -> bool {
+    !user_set
+        && !config.use_embeddings
+        && model_ready
+        && config.doc_sources.iter().any(|s| s.enabled)
 }
 
 fn read_response(response: reqwest::blocking::Response, model: &str) -> Result<Value, EmbedError> {
@@ -306,12 +520,13 @@ pub fn rerank(
             })
             .collect())
     })?;
-    let document = |i: usize| format!("search_document: {}", candidates[i].text);
+    let style = prompting(config);
+    let document = |i: usize| style.passage(&candidates[i].text);
     // The query and the passages missing from the cache go in one embedding request.
     let mut missing: Vec<usize> = (0..vectors.len())
         .filter(|&i| vectors[i].is_none())
         .collect();
-    let mut inputs = vec![format!("search_query: {query}")];
+    let mut inputs = vec![style.query(query)];
     inputs.extend(missing.iter().map(|&i| document(i)));
     let mut fresh = embed(config, &inputs)?;
     let query_vector = fresh.remove(0);
@@ -479,6 +694,106 @@ mod tests {
         assert_eq!(parse_openai(&v), Some(vec![vec![1.0, 0.0], vec![0.0, 1.0]]));
         assert_eq!(parse_openai(&json!({"data":[{"embedding":"x"}]})), None);
         assert_eq!(parse_openai(&json!({"error":"x"})), None);
+    }
+    #[test]
+    fn cache_keys_name_backend_and_model() {
+        let mut c = Config {
+            embedding_backend: "ollama".into(),
+            embedding_model: "qwen3-embedding:4b".into(),
+            ..Default::default()
+        };
+        assert_eq!(cache_model(&c), "ollama:qwen3-embedding:4b");
+        c.embedding_model = "nomic-embed-text".into();
+        assert_eq!(cache_model(&c), "ollama:nomic-embed-text");
+        c.embedding_backend = "llama".into();
+        assert!(cache_model(&c).starts_with("gguf:"));
+    }
+    #[test]
+    fn qwen3_marks_only_the_query() {
+        let qwen = prompting_for("Qwen3-Embedding-4B-Q4_K_M.gguf");
+        assert_eq!(qwen, Prompting::Qwen3);
+        assert_eq!(prompting_for("qwen3-embedding:4b"), Prompting::Qwen3);
+        assert_eq!(
+            qwen.query("how to x"),
+            "Instruct: Given a search query, retrieve relevant passages\nQuery: how to x"
+        );
+        assert_eq!(qwen.passage("text"), "text");
+        let nomic = prompting_for("nomic-embed-text-v1.5.Q8_0.gguf");
+        assert_eq!(nomic.query("q"), "search_query: q");
+        assert_eq!(nomic.passage("p"), "search_document: p");
+        let ollama_qwen = Config {
+            embedding_backend: "Ollama".into(),
+            embedding_model: "qwen3-embedding:4b".into(),
+            ..Default::default()
+        };
+        assert_eq!(prompting(&ollama_qwen), Prompting::Qwen3);
+    }
+    #[test]
+    fn reads_ollama_pull_stream() {
+        assert_eq!(
+            parse_pull_line(
+                r#"{"status":"pulling abc","digest":"sha256:1","total":100,"completed":40}"#
+            ),
+            Some(PullLine::Progress {
+                status: "pulling abc".into(),
+                done: 40,
+                total: 100
+            })
+        );
+        assert_eq!(
+            parse_pull_line(r#"{"status":"pulling manifest"}"#),
+            Some(PullLine::Progress {
+                status: "pulling manifest".into(),
+                done: 0,
+                total: 0
+            })
+        );
+        assert_eq!(
+            parse_pull_line(r#"{"status":"success"}"#),
+            Some(PullLine::Success)
+        );
+        assert_eq!(
+            parse_pull_line(r#"{"error":"pull model manifest: file does not exist"}"#),
+            Some(PullLine::Failed(
+                "pull model manifest: file does not exist".into()
+            ))
+        );
+        assert_eq!(parse_pull_line(""), None);
+        assert_eq!(parse_pull_line("{}"), None);
+    }
+    #[test]
+    fn finds_installed_ollama_models() {
+        let tags = json!({"models":[
+            {"name":"nomic-embed-text:latest","model":"nomic-embed-text:latest"},
+            {"name":"qwen3-embedding:4b"}
+        ]});
+        assert!(lists_ollama_model(&tags, "nomic-embed-text"));
+        assert!(lists_ollama_model(&tags, "Qwen3-Embedding:4b"));
+        assert!(!lists_ollama_model(&tags, "qwen3-embedding:8b"));
+        assert!(!lists_ollama_model(&json!({"error":"x"}), "a"));
+    }
+    #[test]
+    fn rerank_switches_on_only_when_useful() {
+        use crate::docs::{DocSource, SourceMode};
+        let source = |enabled| DocSource {
+            id: "1".into(),
+            name: "docs".into(),
+            path: PathBuf::from("/docs"),
+            mode: SourceMode::Linked,
+            enabled,
+        };
+        let mut c = Config {
+            doc_sources: vec![source(false), source(true)],
+            ..Default::default()
+        };
+        assert!(should_auto_enable(&c, false, true));
+        assert!(!should_auto_enable(&c, true, true));
+        assert!(!should_auto_enable(&c, false, false));
+        c.doc_sources = vec![source(false)];
+        assert!(!should_auto_enable(&c, false, true));
+        c.doc_sources = vec![source(true)];
+        c.use_embeddings = true;
+        assert!(!should_auto_enable(&c, false, true));
     }
     #[test]
     fn cache_stores_and_prunes() {

@@ -40,6 +40,9 @@ pub struct Config {
     pub use_docs: bool,
     pub use_web: bool,
     pub use_embeddings: bool,
+    /// The user toggled Embedding rerank, so it is no longer turned on automatically.
+    #[serde(default)]
+    pub rerank_user_set: bool,
     pub group_chat: bool,
     /// Name of the documentation source to search; empty = all enabled sources.
     pub pack: String,
@@ -133,6 +136,7 @@ impl Default for Config {
             use_docs: true,
             use_web: false,
             use_embeddings: false,
+            rerank_user_set: false,
             group_chat: false,
             pack: String::new(),
             active_persona: 0,
@@ -249,6 +253,16 @@ impl Config {
             "Too many recent projects"
         );
         Ok(())
+    }
+    /// Embedding rerank turns itself on once it can help: an embedding model is installed
+    /// (`embed_installed`), at least one documentation source is enabled, and the user has
+    /// never toggled it.
+    pub fn rerank_should_auto_enable(&self, embed_installed: bool) -> bool {
+        crate::knowledge::embeddings::should_auto_enable(
+            self,
+            self.rerank_user_set,
+            embed_installed,
+        )
     }
     /// Puts `path` first in the recent projects, keeping at most MAX_PROJECTS.
     pub fn remember_project(&mut self, path: &Path) {
@@ -476,6 +490,35 @@ mod tests {
         assert_eq!(old.max_steps, 12);
         assert!(old.window_size.is_none());
         assert!(old.confirm_web_query && old.mcp_servers.is_empty());
+        assert!(!old.rerank_user_set);
+    }
+    #[test]
+    fn rerank_auto_enables_only_when_useful_and_unset() {
+        let mut config = Config::default();
+        assert!(
+            !config.rerank_should_auto_enable(true),
+            "no documentation source"
+        );
+        config.doc_sources = vec![crate::knowledge::docs::DocSource {
+            id: "a".into(),
+            name: "Docs".into(),
+            path: PathBuf::from("/docs"),
+            mode: crate::knowledge::docs::SourceMode::Linked,
+            enabled: true,
+        }];
+        assert!(config.rerank_should_auto_enable(true));
+        assert!(
+            !config.rerank_should_auto_enable(false),
+            "no embedding model"
+        );
+        config.doc_sources[0].enabled = false;
+        assert!(!config.rerank_should_auto_enable(true), "source disabled");
+        config.doc_sources[0].enabled = true;
+        config.rerank_user_set = true;
+        assert!(!config.rerank_should_auto_enable(true), "the user chose");
+        config.rerank_user_set = false;
+        config.use_embeddings = true;
+        assert!(!config.rerank_should_auto_enable(true), "already on");
     }
     #[test]
     fn atomic_save_keeps_backup_and_recovers_from_damage() {

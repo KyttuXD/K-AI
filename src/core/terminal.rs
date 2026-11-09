@@ -306,6 +306,13 @@ impl Tree {
     }
 }
 
+// Nothing to close off Windows (the process group is signalled by kill_tree); the empty
+// Drop keeps `drop(tree)` valid for clippy (drop_non_drop) on macOS and Linux.
+#[cfg(not(windows))]
+impl Drop for Tree {
+    fn drop(&mut self) {}
+}
+
 #[cfg(windows)]
 impl Drop for Tree {
     fn drop(&mut self) {

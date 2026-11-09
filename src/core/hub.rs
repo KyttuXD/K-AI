@@ -29,6 +29,8 @@ pub struct HubFile {
     pub size: u64,
     pub sha256: Option<String>,
     pub url: String,
+    /// A vision projector (the file name contains "mmproj"), not a model.
+    pub mmproj: bool,
 }
 
 /// How a model of a given size fits this machine's RAM.
@@ -130,11 +132,82 @@ fn parse_files(repo: &str, v: &Value) -> Vec<HubFile> {
                     .unwrap_or(0),
                 sha256,
                 url: format!("{HUB}/{repo}/resolve/main/{}", encode_path(path)),
+                mmproj: path.to_lowercase().contains("mmproj"),
             })
         })
         .collect();
     files.sort_by_key(|f| f.size);
     files
+}
+
+/// The vision projector of the repository that goes with `model`: only
+/// projectors named after the model (or generic ones), f16 first, then q8_0,
+/// then any. None when the repository has none for it or `model` is a
+/// projector itself.
+pub fn matching_mmproj(files: &[HubFile], model: &HubFile) -> Option<HubFile> {
+    if model.mmproj {
+        return None;
+    }
+    let base = llama::base_name(Path::new(&model.file));
+    let is_ours = |f: &HubFile| {
+        let b = llama::base_name(Path::new(&f.file));
+        let named = !b.is_empty() && b != "model";
+        !named || llama::same_base(&base, &b)
+    };
+    files
+        .iter()
+        .filter(|f| f.mmproj && f.file != model.file && is_ours(f))
+        .min_by_key(|f| {
+            let name = f.file.to_lowercase();
+            (!name.contains("f16"), !name.contains("q8_0"), f.size)
+        })
+        .cloned()
+}
+
+/// File name a projector is saved under next to `model` in models_dir(), so
+/// llama::find_mmproj pairs the two and generic names ("mmproj-model-f16.gguf")
+/// from different repositories do not overwrite each other:
+/// "mmproj-<model base>-<projector quant>.gguf".
+// The Models page names projectors itself (ui::models::projector_name); kept for callers without one.
+#[allow(dead_code)]
+pub fn mmproj_dest_name(model: &HubFile, projector: &HubFile) -> String {
+    let stem = |f: &HubFile| {
+        Path::new(&f.file)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let model_stem = stem(model);
+    let base = llama::base_name(Path::new(&model.file));
+    // The base keeps the model's own spelling ("Qwen2.5-VL-3B-Instruct").
+    let base = if model_stem.to_lowercase().starts_with(&base)
+        && model_stem.is_char_boundary(base.len())
+    {
+        model_stem[..base.len()].to_string()
+    } else {
+        base
+    };
+    let proj_stem = stem(projector);
+    let quant = proj_stem
+        .rfind(['-', '.'])
+        .map(|cut| &proj_stem[cut + 1..])
+        .filter(|t| llama::is_quant(t))
+        .map(|t| format!("-{t}"))
+        .unwrap_or_default();
+    if base.is_empty() {
+        return safe_file_name(&projector.file);
+    }
+    safe_file_name(&format!("mmproj-{base}{quant}.gguf"))
+}
+
+/// The last path component, with characters unsafe in file names replaced.
+fn safe_file_name(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .chars()
+        .map(|c| if "<>:\"|?*".contains(c) { '_' } else { c })
+        .collect()
 }
 
 /// Percent-encodes a repository path, keeping the slashes.
@@ -150,8 +223,22 @@ fn encode_path(path: &str) -> String {
     out
 }
 
-/// GGUF files in the models folder with their sizes, by name.
+/// GGUF models in the models folder with their sizes, by name. Vision
+/// projectors are not models and are left out (see `installed_projectors`).
 pub fn installed() -> Vec<(PathBuf, u64)> {
+    let mut found = installed_gguf();
+    found.retain(|(p, _)| !llama::is_mmproj(p));
+    found
+}
+
+/// Vision projectors (mmproj GGUFs) in the models folder with their sizes.
+pub fn installed_projectors() -> Vec<(PathBuf, u64)> {
+    let mut found = installed_gguf();
+    found.retain(|(p, _)| llama::is_mmproj(p));
+    found
+}
+
+fn installed_gguf() -> Vec<(PathBuf, u64)> {
     let mut found: Vec<(PathBuf, u64)> = walkdir::WalkDir::new(setup::models_dir())
         .max_depth(3)
         .into_iter()
@@ -182,11 +269,36 @@ pub fn delete(path: &Path) -> Result<()> {
         "Only models in {} can be deleted here",
         root.display()
     );
+    let projector = llama::find_mmproj(&target);
     fs::remove_file(&target).with_context(|| format!("Could not delete {}", target.display()))?;
+    if let Some(projector) = projector {
+        remove_orphan_projector(&projector);
+    }
     let mut part = target.into_os_string();
     part.push(".part");
     let _ = fs::remove_file(part);
     Ok(())
+}
+
+/// Deletes a projector that no remaining model in its folder still uses.
+fn remove_orphan_projector(projector: &Path) {
+    let Some(dir) = projector.parent() else {
+        return;
+    };
+    let used = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            !llama::is_mmproj(p)
+                && p.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+        })
+        .any(|model| llama::find_mmproj(&model).as_deref() == Some(projector));
+    if !used {
+        let _ = fs::remove_file(projector);
+    }
 }
 
 /// How a model of `size` bytes fits this machine's RAM.
@@ -255,6 +367,73 @@ mod tests {
             files[1].url,
             "https://huggingface.co/o/r/resolve/main/q8/M%20Q8_0.gguf"
         );
+    }
+    fn hub_file(file: &str, size: u64) -> HubFile {
+        HubFile {
+            repo: "o/r".into(),
+            file: file.into(),
+            size,
+            sha256: None,
+            url: format!("{HUB}/o/r/resolve/main/{file}"),
+            mmproj: file.to_lowercase().contains("mmproj"),
+        }
+    }
+    #[test]
+    fn flags_and_matches_vision_projectors() {
+        let v = json!([
+            {"type":"file","path":"mmproj-model-f16.gguf","size":800},
+            {"type":"file","path":"Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf","size":2000}
+        ]);
+        let files = parse_files("o/r", &v);
+        assert!(files[0].mmproj && !files[1].mmproj);
+        let model = hub_file("Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf", 2000);
+        let f16 = hub_file("mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf", 800);
+        let q8 = hub_file("mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf", 500);
+        let other = hub_file("mmproj-Qwen2.5-VL-7B-Instruct-q4_0.gguf", 300);
+        let all = vec![other.clone(), q8.clone(), model.clone(), f16.clone()];
+        assert_eq!(matching_mmproj(&all, &model), Some(f16.clone()));
+        let no_f16 = vec![other.clone(), q8.clone(), model.clone()];
+        assert_eq!(matching_mmproj(&no_f16, &model), Some(q8));
+        // Another model's projector is never offered.
+        assert_eq!(
+            matching_mmproj(&[other.clone(), model.clone()], &model),
+            None
+        );
+        let seven = hub_file("Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf", 2000);
+        let big = hub_file("mmproj-Qwen2.5-VL-72B-Instruct-f16.gguf", 900);
+        assert_eq!(matching_mmproj(&[big, seven.clone()], &seven), None);
+        assert_eq!(
+            matching_mmproj(&[other.clone(), seven.clone()], &seven),
+            Some(other)
+        );
+        assert_eq!(matching_mmproj(std::slice::from_ref(&model), &model), None);
+        assert_eq!(matching_mmproj(&all, &f16), None);
+    }
+    #[test]
+    fn projectors_are_saved_under_the_model_name() {
+        let model = hub_file("sub/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf", 2000);
+        let generic = hub_file("mmproj-model-f16.gguf", 800);
+        let name = mmproj_dest_name(&model, &generic);
+        assert_eq!(name, "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf");
+        assert_eq!(
+            mmproj_dest_name(&model, &hub_file("x/mmproj-Q8_0.gguf", 1)),
+            "mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf"
+        );
+        assert_eq!(
+            mmproj_dest_name(&model, &hub_file("mmproj.gguf", 1)),
+            "mmproj-Qwen2.5-VL-3B-Instruct.gguf"
+        );
+        // The saved name pairs with the model in llama::find_mmproj.
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf");
+        fs::write(&model_path, b"x").unwrap();
+        fs::write(dir.path().join(&name), b"x").unwrap();
+        fs::write(dir.path().join("mmproj-gemma-3-4b-it-f16.gguf"), b"x").unwrap();
+        assert_eq!(
+            llama::find_mmproj(&model_path),
+            Some(dir.path().join(&name))
+        );
+        assert_eq!(safe_file_name("a/b:c.gguf"), "b_c.gguf");
     }
     #[test]
     fn validates_repo_names() {

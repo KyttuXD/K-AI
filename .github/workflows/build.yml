@@ -29,6 +29,11 @@ env:
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
   RUST_BACKTRACE: short
+  # Discord voice (songbird > opus2 > libopus_sys): build the libopus sources shipped in that crate with CMake and link
+  # them statically, so no system libopus is needed or bundled (on Linux, pkg-config would otherwise pick up a runner's
+  # libopus-dev). CMake takes the macOS minimum from each job's MACOSX_DEPLOYMENT_TARGET (ld warns if an object
+  # targets a newer macOS).
+  LIBOPUS_BUNDLED: '1'
 jobs:
   lint:
     if: github.event_name != 'schedule'
@@ -46,7 +51,7 @@ jobs:
           shared-key: lint
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Linux native dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends cmake pkg-config libssl-dev libwayland-dev libxkbcommon-dev
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
 
@@ -90,7 +95,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends cmake pkg-config libssl-dev libwayland-dev libxkbcommon-dev
       - name: Tests
         shell: bash
         run: |

@@ -8,6 +8,13 @@ pub const MAX_LORE: usize = 200;
 pub const MAX_LORE_TEXT: usize = 2000;
 pub const MAX_NOTES: usize = 100;
 pub const MAX_NOTE: usize = 500;
+pub const MAX_NAME: usize = 64;
+pub const MAX_INSTRUCTIONS: usize = 4000;
+
+/// Character names compare trimmed and case-insensitively (Unicode).
+pub fn same_name(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
 
 /// A lorebook entry: its text joins the prompt when one of its keys is mentioned.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -55,16 +62,16 @@ pub fn validate(personas: &[Persona]) -> anyhow::Result<()> {
     let mut names = std::collections::HashSet::new();
     for p in personas {
         anyhow::ensure!(
-            !p.name.trim().is_empty() && p.name.chars().count() <= 64,
-            "Character names must be 1–64 characters"
+            !p.name.trim().is_empty() && p.name.chars().count() <= MAX_NAME,
+            "Character names must be 1–{MAX_NAME} characters"
         );
         anyhow::ensure!(
             names.insert(p.name.trim().to_lowercase()),
             "Character names must be unique"
         );
         anyhow::ensure!(
-            p.instructions.chars().count() <= 4000,
-            "Character instructions exceed 4000 characters"
+            p.instructions.chars().count() <= MAX_INSTRUCTIONS,
+            "Character instructions exceed {MAX_INSTRUCTIONS} characters"
         );
         anyhow::ensure!(
             p.avatar_url.is_empty()
@@ -215,6 +222,12 @@ mod tests {
         assert_eq!(names, ["B", "A", "C"]);
         let many: Vec<Persona> = (0..9).map(|i| p(&i.to_string(), 0, true)).collect();
         assert_eq!(group_order(&many).len(), MAX_GROUP);
+    }
+    #[test]
+    fn names_compare_trimmed_and_case_insensitive() {
+        assert!(same_name(" Ada ", "ada"));
+        assert!(same_name("ÉLODIE", "élodie"));
+        assert!(!same_name("Ada", "Adam"));
     }
     #[test]
     fn validates_lore_and_notes() {

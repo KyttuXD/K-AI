@@ -19,6 +19,7 @@ use std::{
 /// The llama.cpp release downloaded when no llama-server is installed.
 pub const LLAMA_TAG: &str = "b12110";
 
+#[derive(Clone, Copy)]
 pub struct ModelChoice {
     pub name: &'static str,
     pub file: &'static str,
@@ -65,8 +66,7 @@ pub const MODELS: &[ModelChoice] = &[
     },
 ];
 
-/// Embedding model for document rerank with llama.cpp (`llama-server --embedding`).
-pub const EMBED_MODEL: ModelChoice = ModelChoice {
+const NOMIC_EMBED: ModelChoice = ModelChoice {
     name: "nomic-embed-text v1.5 (Q8_0)",
     file: "nomic-embed-text-v1.5.Q8_0.gguf",
     url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf",
@@ -74,6 +74,91 @@ pub const EMBED_MODEL: ModelChoice = ModelChoice {
     sha256: "3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7",
     min_ram_gb: 0,
 };
+
+/// Default embedding model for document rerank with llama.cpp
+/// (`llama-server --embedding`): EMBED_MODELS[0], kept for existing callers.
+pub const EMBED_MODEL: ModelChoice = NOMIC_EMBED;
+
+/// An embedding model setup and the Models page can download, with the
+/// llama.cpp pooling it needs and its Ollama name. Derefs to its ModelChoice,
+/// so `choice.file` and `choice.model.file` both work.
+#[derive(Clone, Copy)]
+pub struct EmbedChoice {
+    pub model: ModelChoice,
+    /// `llama-server --pooling` value.
+    pub pooling: &'static str,
+    /// The same model in Ollama (`ollama pull <tag>`).
+    pub ollama_tag: &'static str,
+}
+
+impl std::ops::Deref for EmbedChoice {
+    type Target = ModelChoice;
+    fn deref(&self) -> &ModelChoice {
+        &self.model
+    }
+}
+
+/// EMBED_MODELS[0] is the default (small, fast on any CPU).
+pub const EMBED_MODELS: &[EmbedChoice] = &[
+    EmbedChoice {
+        model: NOMIC_EMBED,
+        pooling: "mean",
+        ollama_tag: "nomic-embed-text",
+    },
+    EmbedChoice {
+        model: ModelChoice {
+            name: "Qwen3 Embedding 4B (Q4_K_M)",
+            file: "Qwen3-Embedding-4B-Q4_K_M.gguf",
+            url: "https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/resolve/main/Qwen3-Embedding-4B-Q4_K_M.gguf",
+            size: 2496703776,
+            sha256: "2b0cf8f17b4c723c27303015383c27ec4bf2d8314bb677d05e920dd70bb0f16b",
+            min_ram_gb: 8,
+        },
+        pooling: "last",
+        ollama_tag: "qwen3-embedding:4b",
+    },
+];
+
+/// The known embedding model with this file name (case-insensitive).
+pub fn embed_choice(file_name: &str) -> Option<&'static EmbedChoice> {
+    EMBED_MODELS
+        .iter()
+        .find(|c| c.model.file.eq_ignore_ascii_case(file_name.trim()))
+}
+
+/// The known embedding model with this Ollama name ("nomic-embed-text" and
+/// "nomic-embed-text:latest" are the same model).
+pub fn embed_choice_for_tag(tag: &str) -> Option<&'static EmbedChoice> {
+    let plain = |t: &str| {
+        let t = t.trim().to_ascii_lowercase();
+        t.strip_suffix(":latest").map(str::to_string).unwrap_or(t)
+    };
+    let tag = plain(tag);
+    EMBED_MODELS.iter().find(|c| plain(c.ollama_tag) == tag)
+}
+
+/// Where a known embedding model is (or would be) downloaded.
+pub fn embed_path(choice: &EmbedChoice) -> PathBuf {
+    models_dir().join(choice.model.file)
+}
+
+/// Downloads a known embedding model into models_dir() (resumable, verified).
+/// Blocking: run it on a worker thread and poll `progress`.
+pub fn download_embed(
+    choice: &EmbedChoice,
+    progress: &Mutex<SetupProgress>,
+    cancel: &AtomicBool,
+) -> Result<PathBuf> {
+    fs::create_dir_all(models_dir())?;
+    download_verified(
+        choice.model.url,
+        choice.model.size,
+        Some(choice.model.sha256),
+        &embed_path(choice),
+        progress,
+        cancel,
+    )
+}
 
 /// Installed RAM in whole GiB (rounded, so a "16 GB" machine reporting 15.8 counts as 16).
 pub fn total_ram_gb() -> Option<u64> {
@@ -412,10 +497,15 @@ pub struct SetupProgress {
 pub struct SetupResult {
     pub server: PathBuf,
     pub model: PathBuf,
+    /// The embedding GGUF for document rerank (kept or downloaded); None for
+    /// the Ollama backend or when the download failed (see progress.stage).
+    pub embed: Option<PathBuf>,
 }
 
 /// Finds or downloads llama-server, then downloads the recommended model unless
-/// config.gguf_model already exists. Blocking: run it on a worker thread and
+/// config.gguf_model already exists, then the default embedding model unless
+/// one is configured or installed (a failed embedding download is reported in
+/// the final stage and does not fail setup). Blocking: run it on a worker thread and
 /// poll `progress`; set `cancel` to stop (partial downloads resume next time).
 /// `progress.finished` is set at the end, with `error` on failure.
 pub fn auto_setup(
@@ -458,14 +548,55 @@ fn run_setup(
             .unwrap_or_else(recommended);
         download_model(&client, choice, progress, cancel)?
     };
-    set_stage(
-        progress,
-        &match note {
-            Some(note) => format!("Ready ({note})"),
-            None => "Ready".into(),
-        },
-    );
-    Ok(SetupResult { server, model })
+    check_cancel(cancel)?;
+    let mut notes: Vec<String> = note.map(String::from).into_iter().collect();
+    let embed = if config.embedding_backend.eq_ignore_ascii_case("ollama") {
+        None
+    } else {
+        match setup_embed(config, progress, cancel) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                // The chat model and server are ready, so neither a cancel nor a
+                // failure here undoes setup; it only skips rerank.
+                if cancel.load(Ordering::Relaxed) {
+                    notes.push("embedding model skipped".into());
+                } else {
+                    notes.push(format!(
+                        "embedding model not downloaded: {e:#}; get it on the Models page"
+                    ));
+                }
+                None
+            }
+        }
+    };
+    set_stage(progress, &ready_stage(&notes));
+    Ok(SetupResult {
+        server,
+        model,
+        embed,
+    })
+}
+
+/// "Ready", or "Ready (note; note)".
+fn ready_stage(notes: &[String]) -> String {
+    if notes.is_empty() {
+        "Ready".into()
+    } else {
+        format!("Ready ({})", notes.join("; "))
+    }
+}
+
+/// The configured embedding GGUF, an installed known one, or a fresh download
+/// of the default.
+fn setup_embed(
+    config: &Config,
+    progress: &Mutex<SetupProgress>,
+    cancel: &AtomicBool,
+) -> Result<PathBuf> {
+    if let Some(path) = llama::embed_model_path(config) {
+        return Ok(path);
+    }
+    download_embed(&EMBED_MODELS[0], progress, cancel)
 }
 
 fn set_stage(progress: &Mutex<SetupProgress>, stage: &str) {
@@ -953,7 +1084,8 @@ mod tests {
     }
     #[test]
     fn model_table_is_consistent() {
-        for m in MODELS.iter().chain([&EMBED_MODEL]) {
+        let embeds = EMBED_MODELS.iter().map(|c| &c.model);
+        for m in MODELS.iter().chain([&EMBED_MODEL]).chain(embeds) {
             assert!(m.url.ends_with(m.file));
             assert_eq!(m.sha256.len(), 64);
             assert!(m.size > 0);
@@ -962,5 +1094,32 @@ mod tests {
             part_path(Path::new("/m/a.gguf")),
             PathBuf::from("/m/a.gguf.part")
         );
+    }
+    #[test]
+    fn embedding_models_are_known_by_file_and_tag() {
+        assert_eq!(EMBED_MODELS[0].file, EMBED_MODEL.file);
+        assert_eq!(EMBED_MODELS[0].pooling, "mean");
+        let qwen = embed_choice("qwen3-embedding-4b-q4_k_m.gguf").unwrap();
+        assert_eq!(
+            (qwen.pooling, qwen.ollama_tag),
+            ("last", "qwen3-embedding:4b")
+        );
+        assert_eq!(qwen.model.size, 2496703776);
+        assert!(embed_choice("other.gguf").is_none());
+        assert_eq!(
+            embed_choice_for_tag("nomic-embed-text:latest").map(|c| c.file),
+            Some(EMBED_MODEL.file)
+        );
+        assert_eq!(
+            embed_choice_for_tag("Qwen3-Embedding:4b").map(|c| c.pooling),
+            Some("last")
+        );
+        assert!(embed_choice_for_tag("qwen3-embedding:8b").is_none());
+        assert!(embed_path(qwen).ends_with("Qwen3-Embedding-4B-Q4_K_M.gguf"));
+    }
+    #[test]
+    fn ready_stage_lists_notes() {
+        assert_eq!(ready_stage(&[]), "Ready");
+        assert_eq!(ready_stage(&["a".into(), "b".into()]), "Ready (a; b)");
     }
 }

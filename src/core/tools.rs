@@ -766,7 +766,8 @@ mod tests {
         let output = command(
             &std::env::current_dir()?,
             std::env::current_exe()?.to_str().unwrap(),
-            &["--list".into()],
+            // Filter to this test so the listing stays under the capture head/tail budget.
+            &["--list".into(), "captures_fast_command_output".into()],
         )?;
         assert!(output.starts_with("Exit code 0: passed"));
         assert!(output.contains("stdout:"));

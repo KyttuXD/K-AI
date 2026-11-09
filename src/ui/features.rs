@@ -4,6 +4,7 @@ use crate::core::{
     secrets,
 };
 use crate::integrations::discord::{self, BotProfile, MemoryScope};
+use crate::integrations::discord_server;
 use std::collections::{HashMap, HashSet};
 
 /// A character file holds either one exported character or a whole list.
@@ -20,7 +21,25 @@ enum BotAction {
     Remove(usize),
 }
 
+/// A change to a bot's per-server files, applied after its card is drawn.
+enum ServerOp {
+    RemoveAuto { guild: u64, channel: u64 },
+    RemoveCharacter { guild: u64, name: String },
+    Export(Persona),
+}
+
+/// A bot's per-server files (auto-reply channels and server characters), read through
+/// `discord_server` and cached for a few seconds while a section is open.
+#[derive(Clone, Default)]
+struct ServerFiles {
+    auto: Vec<(u64, Vec<u64>)>,
+    characters: Vec<(u64, Vec<Persona>)>,
+    loaded: f64,
+}
+
 const MAX_CHARACTER_FILE: u64 = 256_000;
+/// Seconds before an open bot card re-reads its server files.
+const SERVER_FILES_TTL: f64 = 5.0;
 
 impl Studio {
     pub(super) fn characters_ui(&mut self, ui: &mut egui::Ui) {
@@ -264,12 +283,13 @@ impl Studio {
                         ui.label(
                             RichText::new(
                                 "Create a bot, enable Message Content Intent, invite it with the \
-                                 bot and applications.commands scopes plus View Channel and Send \
-                                 Messages, and paste its channel IDs. Each bot only answers \
-                                 prefixed messages and /ask, /group, /stop, /reset in its \
-                                 channels, and only calls characters marked Available on \
-                                 Discord. Code tools and web search are off. Reconnect after \
-                                 changing characters or models.",
+                                 bot scope plus View Channel and Send Messages (Connect and Speak \
+                                 for Music, the matching permissions for Moderation), and paste \
+                                 its channel IDs. Each bot only answers prefixed messages in its \
+                                 channels (and in auto-reply channels, if on), and only calls \
+                                 characters marked Available on Discord. Code tools and web \
+                                 search are off. Reconnect after changing characters, models or \
+                                 bot settings.",
                             )
                             .size(12.0)
                             .color(MUTED),
@@ -285,7 +305,7 @@ impl Studio {
                             .map_or("!ai", |b| b.prefix.as_str());
                         ui.monospace(format!(
                             "{p} hello\n{p} @Name review this idea\n{p} group brainstorm a feature\n\
-                             /ask question: hello character: Name"
+                             {p} stop\n{p} reset"
                         ));
                     });
                 if let Some(a) = action {
@@ -350,6 +370,7 @@ impl Studio {
         let confirming = ui.data(|d| d.get_temp::<usize>(confirm_id)) == Some(i);
         // Keychain work runs after the card, with the bot's name at that moment.
         let mut forget = false;
+        let mut server_op = None;
         Self::card(ui, |ui| {
             let bot = &mut self.config.discord_bots[i];
             ui.horizontal(|ui| {
@@ -472,6 +493,7 @@ impl Studio {
                         }
                     });
             });
+            server_op = bot_features(ui, i, bot, running);
             ui.horizontal(|ui| {
                 if running {
                     if ui.button("Disconnect").clicked() {
@@ -519,6 +541,17 @@ impl Studio {
             self.persist();
             if let Err(e) = forget_bot(&name) {
                 self.error = Some(e.to_string());
+            }
+        }
+        if let Some(op) = server_op {
+            let name = self.config.discord_bots[i].name.clone();
+            match apply_server_op(&name, op) {
+                Ok(Some(done)) => {
+                    self.status = done;
+                    ui.data_mut(|d| d.remove::<ServerFiles>(server_files_id(i, &name)));
+                }
+                Ok(None) => {}
+                Err(e) => self.error = Some(e.to_string()),
             }
         }
         action
@@ -614,6 +647,336 @@ fn id_list(ui: &mut egui::Ui, id: egui::Id, ids: &mut Vec<String>, hint: &str) {
         *ids = parse_ids(&text);
     }
     ui.data_mut(|d| d.insert_temp(id, text));
+}
+
+/// The collapsed Tools, Auto-reply channels and Server characters sections of bot `i`.
+/// Settings lock while the bot runs; the server lists stay readable (Export works too).
+fn bot_features(
+    ui: &mut egui::Ui,
+    i: usize,
+    bot: &mut BotProfile,
+    running: bool,
+) -> Option<ServerOp> {
+    let mut op = None;
+    let p = bot.prefix.trim().to_string();
+    egui::CollapsingHeader::new(RichText::new("Tools").size(12.0))
+        .id_salt(("bot_tools", i))
+        .show(ui, |ui| {
+            ui.add_enabled_ui(!running, |ui| tools_ui(ui, i, bot));
+        })
+        .header_response
+        .on_hover_text("Things the bot can do when asked in plain language. All off by default.");
+    egui::CollapsingHeader::new(RichText::new("Auto-reply channels").size(12.0))
+        .id_salt(("bot_auto", i))
+        .show(ui, |ui| {
+            ui.add_enabled_ui(!running, |ui| {
+                ui.checkbox(&mut bot.auto_channels_enabled, "Enable")
+                    .on_hover_text(format!(
+                        "Admins type \"{p} auto on\" in a channel to have the bot answer every \
+                         message there without the prefix. \"{p} auto off\" and \"{p} auto list\" \
+                         manage them."
+                    ));
+                ui.add_enabled_ui(bot.auto_channels_enabled, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut bot.bot_replies, "Reply to other AI bots")
+                            .on_hover_text(
+                                "Also answer other bots and webhooks in auto-reply channels. Never \
+                             this app's own bots.",
+                            );
+                        ui.add_enabled(
+                            bot.bot_replies,
+                            egui::DragValue::new(&mut bot.bot_reply_limit)
+                                .range(1..=10)
+                                .prefix("Limit "),
+                        )
+                        .on_hover_text(
+                            "Bot-triggered replies in a row per channel, until a person posts.",
+                        );
+                    });
+                });
+            });
+            let files = server_files(ui, i, &bot.name);
+            if files.auto.is_empty() {
+                ui.label(
+                    RichText::new("No auto-reply channels yet.")
+                        .color(MUTED)
+                        .size(12.0),
+                );
+            }
+            for (guild, channels) in &files.auto {
+                ui.label(
+                    RichText::new(format!("Server {guild}"))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                for channel in channels {
+                    ui.horizontal(|ui| {
+                        ui.monospace(channel.to_string());
+                        if remove_button(ui, running) {
+                            op = Some(ServerOp::RemoveAuto {
+                                guild: *guild,
+                                channel: *channel,
+                            });
+                        }
+                    });
+                }
+            }
+        });
+    egui::CollapsingHeader::new(RichText::new("Server characters").size(12.0))
+        .id_salt(("bot_server_chars", i))
+        .show(ui, |ui| {
+            ui.add_enabled_ui(!running, |ui| {
+                ui.checkbox(&mut bot.server_characters, "Enable")
+                    .on_hover_text(format!(
+                        "Server admins add characters with \"{p} character import\" and a JSON \
+                     attachment (this app's or Tavern V1/V2 cards). They only appear in that \
+                     server. Also: list, remove <name>, export <name>."
+                    ));
+                if bot.server_characters {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Per server");
+                        ui.add(egui::DragValue::new(&mut bot.server_char_limit).range(1..=50));
+                        ui.label("Max file");
+                        ui.add(
+                            egui::DragValue::new(&mut bot.server_char_max_kb)
+                                .range(1..=256)
+                                .suffix(" KB"),
+                        );
+                    });
+                }
+            });
+            let files = server_files(ui, i, &bot.name);
+            if files.characters.is_empty() {
+                ui.label(
+                    RichText::new("No server characters yet.")
+                        .color(MUTED)
+                        .size(12.0),
+                );
+            }
+            for (guild, characters) in &files.characters {
+                ui.label(
+                    RichText::new(format!("Server {guild}"))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                for persona in characters {
+                    ui.horizontal(|ui| {
+                        ui.label(&persona.name);
+                        if ui.small_button("Export…").clicked() {
+                            op = Some(ServerOp::Export(persona.clone()));
+                        }
+                        if remove_button(ui, running) {
+                            op = Some(ServerOp::RemoveCharacter {
+                                guild: *guild,
+                                name: persona.name.clone(),
+                            });
+                        }
+                    });
+                }
+            }
+        });
+    op
+}
+
+/// Music, Moderation and Games switches with their settings.
+fn tools_ui(ui: &mut egui::Ui, i: usize, bot: &mut BotProfile) {
+    let tools = &mut bot.tools;
+    let note_id = egui::Id::new(("music_terms_note", i));
+    if ui
+        .checkbox(&mut tools.music, "Music")
+        .on_hover_text(
+            "Plays audio in voice channels: play, skip, stop, pause, resume, queue, leave. \
+             Needs Connect and Speak. yt-dlp is downloaded on first use (macOS 10.15+).",
+        )
+        .changed()
+    {
+        // The terms note shows once, right after Music is turned on.
+        let on = tools.music;
+        ui.data_mut(|d| {
+            if on {
+                d.insert_temp(note_id, true);
+            } else {
+                d.remove::<bool>(note_id);
+            }
+        });
+    }
+    if tools.music {
+        if ui.data(|d| d.get_temp::<bool>(note_id)).unwrap_or(false) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(crate::integrations::music::TOS_NOTE)
+                        .color(ACCENT)
+                        .size(12.0),
+                );
+                if ui.small_button("OK").clicked() {
+                    ui.data_mut(|d| d.remove::<bool>(note_id));
+                }
+            });
+        }
+        let music = &mut tools.music_tools;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("DJ role");
+            ui.add(
+                egui::TextEdit::singleline(&mut music.dj_role)
+                    .hint_text("Anyone")
+                    .desired_width(120.0)
+                    .char_limit(100),
+            )
+            .on_hover_text(
+                "Role name or ID needed to stop, or to skip others' tracks. Blank = anyone.",
+            );
+            ui.label("Per user");
+            ui.add(
+                egui::DragValue::new(&mut music.max_queue_per_user)
+                    .range(1..=50)
+                    .suffix(" tracks"),
+            )
+            .on_hover_text("Most tracks one person may have in the queue.");
+            ui.label("Max length");
+            ui.add(
+                egui::DragValue::new(&mut music.max_track_minutes)
+                    .range(1..=180)
+                    .suffix(" min"),
+            );
+        });
+    }
+    ui.checkbox(&mut tools.moderation, "Moderation")
+        .on_hover_text(
+            "Only for members who have the matching Discord permission. Kicks, bans, bulk deletes \
+         and role changes ask them to confirm.",
+        );
+    if tools.moderation {
+        let m = &mut tools.moderation_settings;
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut m.allow_delete, "Delete messages");
+            ui.checkbox(&mut m.allow_timeout, "Timeout");
+            ui.checkbox(&mut m.allow_kick, "Kick");
+            ui.checkbox(&mut m.allow_ban, "Ban");
+            ui.checkbox(&mut m.allow_roles, "Roles");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Mod log");
+            ui.add(
+                egui::TextEdit::singleline(&mut m.log_channel)
+                    .hint_text("Channel ID (optional)")
+                    .desired_width(180.0)
+                    .char_limit(21),
+            )
+            .on_hover_text("Every moderation action is posted in this channel.");
+        });
+        if !log_channel_ok(&m.log_channel) {
+            ui.label(
+                RichText::new("Mod log must be a numeric channel ID")
+                    .color(ACCENT)
+                    .size(12.0),
+            );
+        }
+    }
+    ui.checkbox(&mut tools.games, "Games")
+        .on_hover_text("Dice, coin flip, rock paper scissors, trivia, polls and number guessing.");
+}
+
+/// A small Remove button, disabled while the bot runs (it keeps its own copy of the files).
+fn remove_button(ui: &mut egui::Ui, running: bool) -> bool {
+    ui.add_enabled(!running, egui::Button::new("Remove").small())
+        .on_disabled_hover_text("Disconnect first")
+        .clicked()
+}
+
+fn log_channel_ok(id: &str) -> bool {
+    id.is_empty() || is_snowflake(id)
+}
+
+fn server_files_id(i: usize, bot: &str) -> egui::Id {
+    egui::Id::new(("server_files", i, bot))
+}
+
+/// Reads bot `i`'s per-server files at most every few seconds; empty servers are skipped.
+fn server_files(ui: &egui::Ui, i: usize, bot: &str) -> ServerFiles {
+    let id = server_files_id(i, bot);
+    let now = ui.input(|input| input.time);
+    if let Some(files) = ui.data(|d| d.get_temp::<ServerFiles>(id))
+        && now - files.loaded < SERVER_FILES_TTL
+    {
+        return files;
+    }
+    let files = ServerFiles {
+        auto: discord_server::load_auto_channels(bot)
+            .0
+            .into_iter()
+            .filter(|(_, channels)| !channels.is_empty())
+            .map(|(guild, channels)| (guild, channels.into_iter().collect()))
+            .collect(),
+        characters: discord_server::ServerStore::for_bot(bot)
+            .character_guilds()
+            .into_iter()
+            .map(|guild| (guild, discord_server::load_characters(bot, guild)))
+            .filter(|(_, list)| !list.is_empty())
+            .collect(),
+        loaded: now,
+    };
+    ui.data_mut(|d| d.insert_temp(id, files.clone()));
+    files
+}
+
+/// Applies a Remove or Export; returns a status line when something changed.
+fn apply_server_op(bot: &str, op: ServerOp) -> anyhow::Result<Option<String>> {
+    match op {
+        ServerOp::RemoveAuto { guild, channel } => {
+            // One locked read-modify-write in the store.
+            if !discord_server::ServerStore::for_bot(bot).set_auto_channel(guild, channel, false)? {
+                return Ok(None);
+            }
+            Ok(Some(format!("Auto-reply off in channel {channel}")))
+        }
+        ServerOp::RemoveCharacter { guild, name } => {
+            let list = discord_server::load_characters(bot, guild);
+            let before = list.len();
+            let kept = without_character(list, &name);
+            if kept.len() == before {
+                return Ok(None);
+            }
+            discord_server::save_characters(bot, guild, &kept)?;
+            Ok(Some(format!("Removed {name} from server {guild}")))
+        }
+        ServerOp::Export(persona) => {
+            let Some(path) = rfd::FileDialog::new()
+                .set_file_name(format!("{}.json", file_stem(&persona.name)))
+                .save_file()
+            else {
+                return Ok(None);
+            };
+            write_json(&path, &persona)?;
+            Ok(Some(format!("Exported {}", persona.name)))
+        }
+    }
+}
+
+/// Removes `channel` from `guild`'s auto-reply list, dropping the server when it empties.
+#[cfg(test)]
+fn remove_channel(
+    map: &mut std::collections::BTreeMap<u64, Vec<u64>>,
+    guild: u64,
+    channel: u64,
+) -> bool {
+    let Some(list) = map.get_mut(&guild) else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|c| *c != channel);
+    let removed = list.len() != before;
+    if list.is_empty() {
+        map.remove(&guild);
+    }
+    removed
+}
+
+/// Drops the character called `name` (case-insensitive, trimmed).
+fn without_character(list: Vec<Persona>, name: &str) -> Vec<Persona> {
+    let name = name.trim().to_lowercase();
+    list.into_iter()
+        .filter(|p| p.name.trim().to_lowercase() != name)
+        .collect()
 }
 
 /// Lorebook entries of character `i`: keys and text, with add and remove.
@@ -792,7 +1155,8 @@ fn check_profile(profile: &BotProfile, all: &[BotProfile]) -> anyhow::Result<()>
         "Bot names must differ in letters or digits"
     );
     anyhow::ensure!(
-        !profile.channels.is_empty(),
+        // Matches discord::Discord::connect: auto-reply channels are added from Discord.
+        !profile.channels.is_empty() || profile.auto_channels_enabled,
         "Enter at least one channel ID"
     );
     anyhow::ensure!(
@@ -804,6 +1168,10 @@ fn check_profile(profile: &BotProfile, all: &[BotProfile]) -> anyhow::Result<()>
         "Channel and server IDs must be numeric Discord IDs"
     );
     anyhow::ensure!(!profile.prefix.trim().is_empty(), "Enter a command prefix");
+    anyhow::ensure!(
+        !profile.tools.moderation || log_channel_ok(&profile.tools.moderation_settings.log_channel),
+        "Mod log must be a numeric channel ID"
+    );
     Ok(())
 }
 
@@ -975,6 +1343,39 @@ mod tests {
         assert!(check_profile(&bot, &[bot.clone(), similar]).is_err());
         let empty = BotProfile::default();
         assert!(check_profile(&empty, std::slice::from_ref(&empty)).is_err());
+        let mut modded = bot.clone();
+        modded.tools.moderation = true;
+        modded.tools.moderation_settings.log_channel = "mod-log".into();
+        assert!(check_profile(&modded, std::slice::from_ref(&modded)).is_err());
+        modded.tools.moderation_settings.log_channel = "123456789012345678".into();
+        assert!(check_profile(&modded, std::slice::from_ref(&modded)).is_ok());
+    }
+
+    #[test]
+    fn new_bot_features_start_off() {
+        let bot = BotProfile::default();
+        assert!(!bot.tools.music && !bot.tools.moderation && !bot.tools.games);
+        assert!(!bot.auto_channels_enabled && !bot.bot_replies && !bot.server_characters);
+        assert!(log_channel_ok("") && !log_channel_ok("12ab"));
+    }
+
+    #[test]
+    fn removes_auto_channels() {
+        let mut map = std::collections::BTreeMap::from([(1u64, vec![10u64, 11]), (2, vec![20])]);
+        assert!(remove_channel(&mut map, 1, 10));
+        assert_eq!(map[&1], [11]);
+        assert!(!remove_channel(&mut map, 1, 99));
+        assert!(!remove_channel(&mut map, 3, 10));
+        assert!(remove_channel(&mut map, 2, 20));
+        assert!(!map.contains_key(&2));
+    }
+
+    #[test]
+    fn removes_server_character_by_name() {
+        let kept = without_character(vec![named("Ada"), named("Bob")], " ada ");
+        let names: Vec<_> = kept.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Bob"]);
+        assert_eq!(without_character(vec![named("Bob")], "Cy").len(), 1);
     }
 
     #[test]

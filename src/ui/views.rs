@@ -30,6 +30,7 @@ enum Fix {
     Ollama,
     Workspace,
     Docs,
+    Embeddings,
 }
 /// What a chat list menu asks for.
 enum ChatAction {
@@ -682,6 +683,10 @@ impl Studio {
                             "Rerank document matches with the embedding model chosen in Settings.",
                         )
                         .changed();
+                    if rerank_toggled {
+                        // The user's choice stops the automatic switch-on.
+                        self.config.rerank_user_set = true;
+                    }
                     if (docs_toggled || rerank_toggled) && self.use_docs && self.use_embeddings {
                         crate::knowledge::embeddings::prewarm(&self.config);
                     }
@@ -871,6 +876,13 @@ impl Studio {
             self.worker.is_none(),
         ));
         rows.push((docs_ok, "Documentation (optional)", "Add…", Fix::Docs, true));
+        rows.push((
+            self.embed_installed(),
+            "Embeddings (optional)",
+            "Models…",
+            Fix::Embeddings,
+            true,
+        ));
         let mut fix = None;
         let mut auto = false;
         let width = ui.available_width().min(440.0);
@@ -946,6 +958,7 @@ impl Studio {
             Some(Fix::Ollama) => self.start_ollama(),
             Some(Fix::Workspace) => self.choose_workspace(),
             Some(Fix::Docs) => self.view = 1,
+            Some(Fix::Embeddings) => self.view = 5,
             None => {}
         }
     }
@@ -1164,6 +1177,9 @@ impl Studio {
             })
         } else if self.draft.trim().is_empty() {
             Some("Type a message first.")
+        } else if !self.attachments.is_empty() && self.images_blocked() {
+            // Attached before switching to a model without vision.
+            Some(NO_VISION)
         } else {
             None
         }
@@ -1247,11 +1263,13 @@ impl Studio {
         let mut send = submit;
         let (mut stop, mut attach) = (false, false);
         ui.horizontal(|ui| {
+            let no_vision = self.images_blocked();
             attach = ui
-                .add_enabled(idle, egui::Button::new("📎").frame(false))
+                .add_enabled(idle && !no_vision, egui::Button::new("📎").frame(false))
                 .on_hover_text(
                     "Attach images (PNG, JPEG, WebP) for a vision model, or audio to transcribe into the message. Images can also be dropped or pasted as files.",
                 )
+                .on_disabled_hover_text(if no_vision { NO_VISION } else { "Wait for the reply." })
                 .clicked();
             ui.add(
                 egui::Label::new(RichText::new(&self.status).size(11.0).color(p.muted)).truncate(),
@@ -1542,12 +1560,20 @@ impl Studio {
                 if ui
                     .selectable_label(self.config.embedding_backend == value, label)
                     .clicked()
+                    && self.config.embedding_backend != value
                 {
                     self.config.embedding_backend = value.into();
+                    // The Models page and the rerank read the same setting; a llama.cpp
+                    // embedding server is not needed while Ollama embeds.
+                    if value == "ollama" {
+                        self.embed_runtime.stop();
+                    }
                 }
             }
         });
+        let mut open_models = false;
         if self.config.embedding_backend == "ollama" {
+            let installed = self.embed_installed();
             ui.horizontal(|ui| {
                 ui.label("Embedding model");
                 egui::ComboBox::from_id_salt("embedding_model")
@@ -1563,25 +1589,46 @@ impl Studio {
                     })
                     .response
                     .on_hover_text("Used by Embedding rerank in Chat options. Requires Ollama.");
-            });
-        } else {
-            let name = self
-                .config
-                .embedding_gguf
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "No embedding model".into());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(name).size(12.0).color(p.muted))
-                    .on_hover_text(self.config.embedding_gguf.display().to_string());
-                if ui
-                    .small_button("Models…")
-                    .on_hover_text("Choose, download and start the embedding model")
-                    .clicked()
-                {
-                    self.view = 5;
+                if !installed {
+                    ui.label(RichText::new("Not installed").size(12.0).color(p.muted))
+                        .on_hover_text("Install it from the Models page.");
+                    open_models = ui
+                        .small_button("Models…")
+                        .on_hover_text("Install an embedding model with Ollama")
+                        .clicked();
                 }
             });
+        } else {
+            // What the embedding server serves: the chosen GGUF, else the downloaded default
+            // (the same file the Models page marks active).
+            let configured = &self.config.embedding_gguf;
+            let (name, hover) = match &self.embed_path {
+                Some(path) => (
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    path.display().to_string(),
+                ),
+                None if !configured.as_os_str().is_empty() => (
+                    "Embedding model missing".into(),
+                    format!("{} was not found", configured.display()),
+                ),
+                None => (
+                    "No embedding model".into(),
+                    "Download one on the Models page".into(),
+                ),
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name).size(12.0).color(p.muted))
+                    .on_hover_text(hover);
+                open_models = ui
+                    .small_button("Models…")
+                    .on_hover_text("Choose, download and start the embedding model")
+                    .clicked();
+            });
+        }
+        if open_models {
+            self.view = 5;
         }
     }
 
@@ -1913,6 +1960,7 @@ impl Studio {
                 if ui.button("Stop model").clicked() {
                     self.llama.stop();
                     self.live_port = None;
+                    self.vision = None;
                     self.metrics = None;
                     self.check();
                 }

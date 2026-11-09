@@ -36,6 +36,8 @@ const MIN_FLASH_AUTO: u32 = 6325;
 const MIN_METRICS: u32 = 2500;
 const MIN_SLOT_SAVE: u32 = 3100;
 const MIN_DRAFT_MAX: u32 = 4300;
+/// llama-server takes images (`--mmproj`, `--no-mmproj-offload`) from here.
+const MIN_MMPROJ: u32 = 5400;
 /// `--cache-ram` (host-RAM prompt cache, on by default at 8 GiB) and `--fit`:
 /// passed only to builds known to have them (the bundled tag), since an older
 /// or unknown build would exit on the unknown flag.
@@ -115,6 +117,125 @@ pub struct ModelPreset {
     pub repeat_penalty: Option<f32>,
     /// Small GGUF of the same family for speculative decoding.
     pub draft_model: Option<PathBuf>,
+    /// Vision projector (mmproj GGUF); found next to the model when unset.
+    #[serde(default)]
+    pub mmproj: Option<PathBuf>,
+}
+
+/// True for a vision projector GGUF (its file name contains "mmproj").
+pub fn is_mmproj(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.to_string_lossy().to_lowercase().contains("mmproj"))
+}
+
+/// True for a quantization or precision tag such as Q4_K_M, IQ4_XS, f16, bf16.
+pub(crate) fn is_quant(token: &str) -> bool {
+    let t = token.to_ascii_lowercase();
+    if matches!(t.as_str(), "f16" | "f32" | "bf16" | "fp16" | "fp32" | "q8") {
+        return true;
+    }
+    let rest = t.strip_prefix("iq").or_else(|| t.strip_prefix('q'));
+    rest.is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Lowercase file stem without trailing quant tags and without "mmproj":
+/// "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf" and
+/// "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf" both give "qwen2.5-vl-3b-instruct".
+pub(crate) fn base_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+        .replace("mmproj", "");
+    let seps: &[char] = &['-', '.', '_', ' '];
+    let mut base = stem.trim_matches(seps).to_string();
+    while let Some(cut) = base.rfind(['-', '.']) {
+        if !is_quant(&base[cut + 1..]) {
+            break;
+        }
+        base = base[..cut].trim_end_matches(seps).to_string();
+    }
+    // "mmproj-f16.gguf" names no model at all.
+    if is_quant(&base) {
+        base.clear();
+    }
+    base
+}
+
+/// A projector name that names no model ("mmproj-model-f16.gguf", "mmproj.gguf").
+fn generic_projector(base: &str) -> bool {
+    base.len() < 3 || base == "model"
+}
+
+/// The vision projector for `model`: a *.gguf in the same folder whose name
+/// contains "mmproj" and shares the model's base name (quant tags stripped),
+/// else the only projector in that folder when its name names no model.
+/// (The preset's projector wins over this; see `mmproj_for`.)
+pub fn find_mmproj(model: &Path) -> Option<PathBuf> {
+    if is_mmproj(model) {
+        return None;
+    }
+    let dir = model.parent()?;
+    let ggufs: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+        })
+        .collect();
+    let (projectors, models): (Vec<PathBuf>, Vec<PathBuf>) =
+        ggufs.into_iter().partition(|p| is_mmproj(p));
+    // A generic projector is only safe to pair when no other model shares the folder.
+    let lone_model = models.len() <= 1;
+    pick_mmproj(model, projectors, lone_model)
+}
+
+/// Whether two base names name the same model: the longer one starts with the
+/// shorter one followed by nothing or a separator ("qwen2.5-vl-7b" is not
+/// "qwen2.5-vl-72b", but it is "qwen2.5-vl-7b-instruct").
+pub(crate) fn same_base(a: &str, b: &str) -> bool {
+    let (s, l) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    l.starts_with(s) && (l.len() == s.len() || l[s.len()..].starts_with(['-', '.', '_']))
+}
+
+/// The choice behind `find_mmproj`, kept separate so it can be tested.
+/// `lone_model`: the model is the only non-projector GGUF in its folder.
+fn pick_mmproj(model: &Path, mut projectors: Vec<PathBuf>, lone_model: bool) -> Option<PathBuf> {
+    let base = base_name(model);
+    if base.is_empty() {
+        return None;
+    }
+    // f16 before q8_0 before others, then by name, so the pick is stable.
+    projectors.sort_by_key(|p| {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        (!name.contains("f16"), !name.contains("q8"), name)
+    });
+    let matching = projectors.iter().find(|p| {
+        let b = base_name(p);
+        !generic_projector(&b) && same_base(&base, &b)
+    });
+    if let Some(p) = matching {
+        return Some(p.clone());
+    }
+    match projectors.as_slice() {
+        [only] if lone_model && generic_projector(&base_name(only)) => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// The projector a launch of the selected model uses: the preset's when it is
+/// a file, else one found next to the model.
+pub fn mmproj_for(config: &Config) -> Option<PathBuf> {
+    preset(config)
+        .and_then(|p| p.mmproj.clone())
+        .filter(|p| p.is_file())
+        .or_else(|| find_mmproj(&config.gguf_model))
 }
 
 /// The preset of the selected GGUF file, if any.
@@ -485,6 +606,15 @@ pub fn server_args(config: &Config, launch: &Launch) -> Vec<String> {
             args.extend(["-ngld".into(), "0".into()]);
         }
     }
+    if supports(MIN_MMPROJ)
+        && let Some(mmproj) = mmproj_for(config)
+    {
+        // Vision: the projector encodes images for the model.
+        args.extend(["--mmproj".into(), mmproj.display().to_string()]);
+        if on_cpu || cpu {
+            args.push("--no-mmproj-offload".into());
+        }
+    }
     args
 }
 
@@ -805,6 +935,14 @@ impl Job {
     }
 }
 
+// An empty Drop keeps `drop(job)` meaningful on every platform: on Windows dropping the
+// job closes its handle (killing the process tree); elsewhere there is nothing to close,
+// and without this clippy rejects the call (drop_non_drop) on macOS and Linux CI.
+#[cfg(not(windows))]
+impl Drop for Job {
+    fn drop(&mut self) {}
+}
+
 #[cfg(unix)]
 fn not_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1109,6 +1247,13 @@ pub struct Runtime {
     slots: Arc<AtomicBool>,
     /// The slot file saved during this run (saved once per run).
     saved_prefix: Arc<Mutex<Option<String>>>,
+    /// Whether the running server accepts images (GET /props), read once per run.
+    vision: Arc<Mutex<Option<bool>>>,
+}
+
+/// `modalities.vision` of GET /props; a server without the field has no vision.
+fn parse_vision(props: &Value) -> bool {
+    props["modalities"]["vision"].as_bool().unwrap_or(false)
 }
 
 /// Identifies a launch: the server binary and its arguments (sampling settings
@@ -1219,6 +1364,7 @@ impl Runtime {
         *self.backend.lock().unwrap() = Some(backend);
         *self.current.lock().unwrap() = Some((launch_key(config), launch.port));
         *self.saved_prefix.lock().unwrap() = None;
+        *self.vision.lock().unwrap() = None;
         self.slots.store(slots, Ordering::SeqCst);
         self.crashed.store(false, Ordering::SeqCst);
         self.live.store(true, Ordering::SeqCst);
@@ -1341,9 +1487,43 @@ impl Runtime {
         mb
     }
 
+    /// Whether the running model accepts images: GET /props → modalities.vision,
+    /// asked once per start or restart and cached. None while no server runs or
+    /// it did not answer. Blocking the first time after a start (one local
+    /// request, 2 s at most): call it off the UI thread, or use `vision_cached`.
+    pub fn vision(&self, port: u16) -> Option<bool> {
+        if !self.running() {
+            return None;
+        }
+        if let Some(known) = *self.vision.lock().unwrap() {
+            return Some(known);
+        }
+        let props: Value = local_client()
+            .ok()?
+            .get(format!("http://127.0.0.1:{port}/props"))
+            .send()
+            .ok()
+            .filter(|r| r.status().is_success())?
+            .json()
+            .ok()?;
+        let vision = parse_vision(&props);
+        *self.vision.lock().unwrap() = Some(vision);
+        Some(vision)
+    }
+
+    /// The last `vision` answer of this run, without a request (for the UI thread).
+    #[allow(dead_code)]
+    pub fn vision_cached(&self) -> Option<bool> {
+        if !self.running() {
+            return None;
+        }
+        *self.vision.lock().unwrap()
+    }
+
     pub fn stop(&self) {
         self.live.store(false, Ordering::SeqCst);
         self.crashed.store(false, Ordering::SeqCst);
+        *self.vision.lock().unwrap() = None;
         *self.backend.lock().unwrap() = None;
         *self.current.lock().unwrap() = None;
         *self.ram.lock().unwrap() = None;
@@ -1351,20 +1531,67 @@ impl Runtime {
     }
 }
 
-/// The embedding GGUF to serve: the configured one, else setup's EMBED_MODEL
-/// when it was downloaded.
+/// The embedding GGUF to serve: the configured one, else the first known
+/// embedding model (setup::EMBED_MODELS, default first) that was downloaded.
 pub fn embed_model_path(config: &Config) -> Option<PathBuf> {
     let configured = &config.embedding_gguf;
     if !configured.as_os_str().is_empty() {
         return configured.is_file().then(|| configured.clone());
     }
-    let default = setup::models_dir().join(setup::EMBED_MODEL.file);
-    default.is_file().then_some(default)
+    setup::EMBED_MODELS
+        .iter()
+        .map(setup::embed_path)
+        .find(|p| p.is_file())
+}
+
+/// How the embedding server runs a model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EmbedProfile {
+    /// `--pooling`, for known models only (others use the GGUF's own).
+    pooling: Option<&'static str>,
+    ctx: usize,
+    /// -b and -ub: one input must fit in a single micro-batch.
+    batch: usize,
+}
+
+/// Known models by file name get their pooling; Qwen3-Embedding (32k
+/// context, last-token pooling) gets a 4096-token batch on 16 GB or more,
+/// else 2048 (no input is longer than about 2k tokens). Everything else keeps
+/// 8192 context and 2048 batch. The context is four slots (`--parallel 4`)
+/// of one full batch each, so every slot holds the longest input.
+fn embed_profile(model: &Path, ram_gb: Option<u64>) -> EmbedProfile {
+    let name = model
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let pooling = setup::embed_choice(&name).map(|c| c.pooling);
+    if name.to_lowercase().contains("qwen3-embedding") {
+        let batch = match ram_gb.unwrap_or(0) {
+            r if r >= 16 => 4096,
+            _ => 2048,
+        };
+        return EmbedProfile {
+            pooling: pooling.or(Some("last")),
+            ctx: batch * 4,
+            batch,
+        };
+    }
+    EmbedProfile {
+        pooling,
+        ctx: 8192,
+        batch: 2048,
+    }
 }
 
 /// Arguments for the embedding server: CPU only (no VRAM taken from the chat
-/// model), four slots of 2048 tokens, and a batch large enough for one passage.
-fn embed_args(model: &Path, port: u16, threads: usize, build: Option<u32>) -> Vec<String> {
+/// model), four slots, and a batch large enough for one passage.
+fn embed_args(
+    model: &Path,
+    port: u16,
+    threads: usize,
+    build: Option<u32>,
+    profile: EmbedProfile,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-m".into(),
         model.display().to_string(),
@@ -1373,19 +1600,21 @@ fn embed_args(model: &Path, port: u16, threads: usize, build: Option<u32>) -> Ve
         "--port".into(),
         port.to_string(),
     ];
+    args.extend(["--alias", EMBED_ALIAS, "--embedding"].map(String::from));
+    if let Some(pooling) = profile.pooling {
+        args.extend(["--pooling".into(), pooling.into()]);
+    }
+    let (ctx, batch) = (profile.ctx.to_string(), profile.batch.to_string());
     args.extend(
         [
-            "--alias",
-            EMBED_ALIAS,
-            "--embedding",
             "-c",
-            "8192",
+            ctx.as_str(),
             "--parallel",
             "4",
             "-b",
-            "2048",
+            batch.as_str(),
             "-ub",
-            "2048",
+            batch.as_str(),
             "-ngl",
             "0",
         ]
@@ -1441,7 +1670,7 @@ impl EmbedRuntime {
     pub fn start(&self, config: &Config) -> Result<u16> {
         let _starting = self.starting.lock().unwrap();
         let model = embed_model_path(config)
-            .context("Download an embedding model (nomic-embed-text) or choose a GGUF first")?;
+            .context("Download an embedding model on the Models page or choose a GGUF first")?;
         let current = self.state.lock().unwrap().clone();
         if self.running()
             && let Some((served, port)) = current
@@ -1457,7 +1686,8 @@ impl EmbedRuntime {
         let port = free_port(config.llama_port.saturating_add(100))
             .context("No free port for the embedding server")?;
         let build = server_version(&server).as_deref().and_then(build_number);
-        let args = embed_args(&model, port, config.llama_threads, build);
+        let profile = embed_profile(&model, setup::total_ram_gb());
+        let args = embed_args(&model, port, config.llama_threads, build, profile);
         self.proc
             .spawn(&server, &args, File::create(&log_path)?, &embed_pid_path())?;
         if let Err(e) = wait_ready(port, EMBED_ALIAS, &log_path, &|| self.running()) {
@@ -1732,15 +1962,154 @@ mod tests {
     }
     #[test]
     fn embedding_server_args() {
-        let args = embed_args(Path::new("/m/nomic.gguf"), 8180, 4, None).join(" ");
+        let model = Path::new("/m/nomic.gguf");
+        let profile = embed_profile(model, Some(16));
+        let args = embed_args(model, 8180, 4, None, profile).join(" ");
         assert!(args.contains("--embedding") && args.contains("--port 8180"));
         assert!(args.contains(&format!("--alias {EMBED_ALIAS}")));
+        assert!(args.contains("-c 8192 --parallel 4 -b 2048 -ub 2048"));
         assert!(args.contains("-ngl 0 --device none -t 4"));
+        assert!(!args.contains("--pooling"));
         assert!(
-            !embed_args(Path::new("a"), 1, 0, Some(3000))
+            !embed_args(Path::new("a"), 1, 0, Some(3000), profile)
                 .join(" ")
                 .contains("--device")
         );
+    }
+    #[test]
+    fn known_embedding_models_get_pooling_and_batches() {
+        let nomic = Path::new("/m").join(setup::EMBED_MODEL.file);
+        let p = embed_profile(&nomic, Some(4));
+        assert_eq!((p.pooling, p.ctx, p.batch), (Some("mean"), 8192, 2048));
+        let qwen = Path::new("/m/Qwen3-Embedding-4B-Q4_K_M.gguf");
+        let big = embed_profile(qwen, Some(32));
+        assert_eq!(
+            (big.pooling, big.ctx, big.batch),
+            (Some("last"), 16384, 4096)
+        );
+        let mid = embed_profile(qwen, Some(8));
+        assert_eq!((mid.ctx, mid.batch), (8192, 2048));
+        let small = embed_profile(qwen, None);
+        assert_eq!((small.ctx, small.batch), (8192, 2048));
+        // Each of the four slots holds one full batch.
+        for p in [big, mid, small] {
+            assert_eq!(p.ctx, p.batch * 4);
+        }
+        // Another Qwen3-Embedding quant still pools on the last token.
+        let other = embed_profile(Path::new("Qwen3-Embedding-0.6B-f16.gguf"), Some(16));
+        assert_eq!(other.pooling, Some("last"));
+        let args = embed_args(qwen, 1, 0, None, big).join(" ");
+        assert!(args.contains("--pooling last -c 16384 --parallel 4 -b 4096 -ub 4096"));
+    }
+    #[test]
+    fn finds_the_matching_vision_projector() {
+        let p = |s: &str| PathBuf::from(format!("/m/{s}"));
+        let model = p("Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf");
+        assert_eq!(base_name(&model), "qwen2.5-vl-3b-instruct");
+        assert_eq!(
+            base_name(&p("mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf")),
+            "qwen2.5-vl-3b-instruct"
+        );
+        assert_eq!(
+            base_name(&p("nomic-embed-text-v1.5.Q8_0.gguf")),
+            "nomic-embed-text-v1.5"
+        );
+        let own = p("mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf");
+        let own_q8 = p("mmproj-Qwen2.5-VL-3B-Instruct-q8_0.gguf");
+        let other = p("mmproj-gemma-3-4b-it-f16.gguf");
+        assert_eq!(
+            pick_mmproj(
+                &model,
+                vec![other.clone(), own_q8.clone(), own.clone()],
+                true
+            ),
+            Some(own.clone())
+        );
+        assert_eq!(
+            pick_mmproj(&model, vec![other.clone(), own_q8.clone()], true),
+            Some(own_q8)
+        );
+        // A projector of another model is never used, even when it is the only one.
+        assert_eq!(pick_mmproj(&model, vec![other.clone()], true), None);
+        assert_eq!(
+            pick_mmproj(&p("Llama-3.2-1B-Q4_K_M.gguf"), vec![own], true),
+            None
+        );
+        // Base names match on a word boundary: 7B is not 72B.
+        let seven = p("Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf");
+        let big = p("mmproj-Qwen2.5-VL-72B-Instruct-f16.gguf");
+        assert_eq!(pick_mmproj(&seven, vec![big], true), None);
+        assert_eq!(
+            pick_mmproj(
+                &p("Qwen2.5-VL-7B-Q4_K_M.gguf"),
+                vec![p("mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf")],
+                true
+            ),
+            Some(p("mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf"))
+        );
+        assert!(same_base("qwen2.5-vl-7b", "qwen2.5-vl-7b"));
+        assert!(same_base("qwen2.5-vl-7b-instruct", "qwen2.5-vl-7b"));
+        assert!(!same_base("qwen2.5-vl-7b", "qwen2.5-vl-72b-instruct"));
+        // A generic projector is used when it is the only one in the folder.
+        let generic = p("mmproj-model-f16.gguf");
+        assert_eq!(
+            pick_mmproj(&model, vec![generic.clone()], true),
+            Some(generic.clone())
+        );
+        // ...and only when the model is the only one there too.
+        assert_eq!(pick_mmproj(&model, vec![generic.clone()], false), None);
+        assert_eq!(
+            pick_mmproj(&model, vec![generic, p("mmproj-F16.gguf")], true),
+            None
+        );
+        assert_eq!(base_name(&p("mmproj-F16.gguf")), "");
+        assert!(is_mmproj(&other) && !is_mmproj(&model));
+        assert_eq!(find_mmproj(&other), None);
+        assert!(is_quant("Q4_K_M") && is_quant("iq4_xs") && is_quant("BF16"));
+        assert!(!is_quant("qwen3") && !is_quant("instruct") && !is_quant("3b"));
+    }
+    #[test]
+    fn projector_next_to_the_model_is_passed_to_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("gemma-3-4b-it-Q4_K_M.gguf");
+        let proj = dir.path().join("mmproj-gemma-3-4b-it-f16.gguf");
+        fs::write(&model, b"x").unwrap();
+        let mut c = config();
+        c.gguf_model = model;
+        assert!(
+            !server_args(&c, &launch(false))
+                .join(" ")
+                .contains("--mmproj")
+        );
+        fs::write(&proj, b"x").unwrap();
+        let gpu = server_args(&c, &launch(false)).join(" ");
+        assert!(gpu.contains(&format!("--mmproj {}", proj.display())));
+        assert!(!gpu.contains("--no-mmproj-offload"));
+        let cpu = server_args(&c, &launch(true)).join(" ");
+        assert!(cpu.contains("--no-mmproj-offload"));
+        // A preset projector wins over the one found in the folder.
+        let chosen = dir.path().join("custom-projector.gguf");
+        fs::write(&chosen, b"x").unwrap();
+        c.model_presets.insert(
+            "gemma-3-4b-it-Q4_K_M.gguf".into(),
+            ModelPreset {
+                mmproj: Some(chosen.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(mmproj_for(&c), Some(chosen));
+    }
+    #[test]
+    fn reads_vision_from_props() {
+        let v = serde_json::json!({"modalities":{"vision":true,"audio":false}});
+        assert!(parse_vision(&v));
+        assert!(!parse_vision(
+            &serde_json::json!({"modalities":{"vision":false}})
+        ));
+        assert!(!parse_vision(
+            &serde_json::json!({"default_generation_settings":{}})
+        ));
+        assert_eq!(Runtime::default().vision_cached(), None);
     }
     #[test]
     fn non_avx2_windows_prefers_cpu_build() {

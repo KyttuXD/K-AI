@@ -379,6 +379,8 @@ enum SystemEvent {
     /// (grouped on the worker thread, so a large workspace does not stall the frame).
     Files(PathBuf, Vec<String>, Vec<(String, Vec<(String, String)>)>),
     Metrics(Option<llama::Metrics>),
+    /// Whether the model served on this port reads images (GET /props), None if unknown.
+    Vision(u16, Option<bool>),
     /// MCP server name and its tool names, from Settings → Test.
     McpTest(String, Result<Vec<String>, String>),
     Transcribed(Result<String, String>),
@@ -537,7 +539,12 @@ pub struct Studio {
     last_server_scan: Instant,
     /// Cached checks for the setup list: model file, workspace folder, a documentation source.
     paths_ok: [bool; 3],
+    /// The embedding GGUF llama.cpp would serve (llama::embed_model_path), refreshed with paths_ok.
+    embed_path: Option<PathBuf>,
     live_port: Option<u16>,
+    /// The running llama-server's model reads images; None while unknown (loading, another
+    /// backend), and then images are not blocked.
+    vision: Option<bool>,
     metrics: Option<llama::Metrics>,
     metrics_busy: bool,
     last_metrics: Instant,
@@ -789,6 +796,28 @@ fn suggested_path(lang: &str, code: &str) -> String {
         .then(|| looks_like_path(rest))
         .flatten()
         .unwrap_or_default()
+}
+/// Hover text on the attach button while the running model cannot read images.
+pub(super) const NO_VISION: &str =
+    "This model can't see images. Use a vision model with its mmproj file (Models page).";
+/// New images are refused only for the app's own running llama-server whose /props says
+/// it has no vision; unknown (loading, Ollama, another endpoint) never blocks.
+fn images_blocked(direct_backend: bool, llama_live: bool, vision: Option<bool>) -> bool {
+    direct_backend && llama_live && vision == Some(false)
+}
+/// Ollama lists models with a tag ("nomic-embed-text:latest"); a configured name without
+/// one means ":latest".
+fn ollama_has(models: &[String], wanted: &str) -> bool {
+    let full = |name: &str| {
+        let name = name.trim().to_lowercase();
+        if name.contains(':') {
+            name
+        } else {
+            format!("{name}:latest")
+        }
+    };
+    let wanted = full(wanted);
+    wanted != ":latest" && models.iter().any(|m| full(m) == wanted)
 }
 fn image_mime(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -1226,7 +1255,9 @@ impl Studio {
             server_key: config.llama_server.clone(),
             last_server_scan: Instant::now(),
             paths_ok: [false; 3],
+            embed_path: None,
             live_port: None,
+            vision: None,
             metrics: None,
             metrics_busy: false,
             last_metrics: Instant::now(),
@@ -1290,6 +1321,40 @@ impl Studio {
                 .iter()
                 .any(|s| s.enabled && s.path.exists()),
         ];
+        self.embed_path = llama::embed_model_path(&self.config);
+        self.auto_enable_rerank();
+    }
+    /// An embedding model is ready for the configured backend: a GGUF for llama.cpp, or
+    /// the configured model listed by Ollama.
+    pub(super) fn embed_installed(&self) -> bool {
+        if self.config.embedding_backend == "ollama" {
+            ollama_has(&self.embedding_models, &self.config.embedding_model)
+        } else {
+            self.embed_path.is_some()
+        }
+    }
+    /// Turns Embedding rerank on once a model is installed and documentation is enabled,
+    /// unless the user has toggled it themselves.
+    fn auto_enable_rerank(&mut self) {
+        self.sync_options();
+        if self
+            .config
+            .rerank_should_auto_enable(self.embed_installed())
+        {
+            self.use_embeddings = true;
+            self.config.use_embeddings = true;
+            if self.use_docs {
+                crate::knowledge::embeddings::prewarm(&self.config);
+            }
+        }
+    }
+    /// Images are refused only when the app's own llama-server reports a model without vision.
+    pub(super) fn images_blocked(&self) -> bool {
+        images_blocked(
+            self.config.direct_backend,
+            self.live_port.is_some(),
+            self.vision,
+        )
     }
     /// Queues a file write on the writer thread (written here if the thread is gone).
     fn queue_write(&mut self, path: PathBuf, payload: impl Into<Payload>) {
@@ -1729,6 +1794,7 @@ impl Studio {
         self.llama_busy = true;
         self.llama_crash = None;
         self.crash_reported = false;
+        self.vision = None;
         self.connection = "Loading model…".into();
         let runtime = self.llama.clone();
         let config = self.config.clone();
@@ -1925,12 +1991,29 @@ impl Studio {
                             }
                             self.config.model = llama::model_alias(&self.config);
                             self.persist();
+                            // Started or restarted (possibly another model): ask again.
+                            self.vision = None;
+                            let runtime = self.llama.clone();
+                            self.background(move || {
+                                SystemEvent::Vision(port, runtime.vision(port))
+                            });
                         }
-                        Err(e) => self.error = Some(e),
+                        Err(e) => {
+                            self.vision = None;
+                            self.error = Some(e);
+                        }
                     }
                     self.check();
                 }
-                SystemEvent::Embeddings(models) => self.embedding_models = models,
+                SystemEvent::Vision(port, vision) => {
+                    if self.live_port == Some(port) {
+                        self.vision = vision;
+                    }
+                }
+                SystemEvent::Embeddings(models) => {
+                    self.embedding_models = models;
+                    self.auto_enable_rerank();
+                }
                 SystemEvent::Models(result) => {
                     self.checking = false;
                     match result {
@@ -1990,6 +2073,11 @@ impl Studio {
                     match result {
                         Ok(done) => {
                             self.config.gguf_model = done.model;
+                            // The embedding model is optional: setup reports a failed
+                            // download in its progress and leaves this None.
+                            if let Some(embed) = done.embed {
+                                self.config.embedding_gguf = embed;
+                            }
                             if llama::find_server(&self.config).as_ref() != Some(&done.server) {
                                 self.config.llama_server = done.server;
                             }
@@ -2154,6 +2242,16 @@ impl Studio {
                         }
                         Err(e) => {
                             self.can_continue = false;
+                            // Drop the empty reply bubble of a request that failed before
+                            // any text arrived; the error banner says what went wrong.
+                            if self
+                                .conversation
+                                .messages
+                                .last()
+                                .is_some_and(|m| m.role != "You" && m.text.trim().is_empty())
+                            {
+                                self.conversation.messages.pop();
+                            }
                             self.status = e.clone();
                             self.error = Some(e);
                         }
@@ -2338,8 +2436,17 @@ impl Studio {
             .messages
             .push(Message::new(persona.name.clone(), String::new()));
         let mut config = self.config.clone();
+        // llama.cpp serves one model at a time: a character's own model only applies
+        // while that model is the one being served; otherwise use the selected model.
         if !persona.model.is_empty() {
-            config.model = persona.model.clone();
+            if self.models.contains(&persona.model) {
+                config.model = persona.model.clone();
+            } else {
+                self.activity.push(format!(
+                    "{}'s model {} is not running; using {}",
+                    persona.name, persona.model, config.model
+                ));
+            }
         }
         let mut request = engine::Request {
             config,
@@ -2353,6 +2460,8 @@ impl Studio {
             persona,
             use_web: self.use_web,
             use_embeddings: self.use_embeddings,
+            // Tool hosts are for Discord; the desktop chat uses workspace tools.
+            tool_host: None,
         };
         if !images.is_empty() {
             engine::attach_images(&mut request.history, &images);
@@ -2487,6 +2596,10 @@ impl Studio {
                 self.error = Some(format!("{name} is not a PNG, JPEG or WebP image."));
                 continue;
             };
+            if self.images_blocked() {
+                self.error = Some(NO_VISION.into());
+                continue;
+            }
             if self.attachments.len() >= 4 {
                 self.error = Some("At most 4 images per message.".into());
                 break;
@@ -3985,6 +4098,28 @@ mod tests {
         assert_eq!(suggested_path("rust", "fn a() {}"), "");
         assert_eq!(suggested_path("", "// https://example.com/x.js"), "");
         assert_eq!(suggested_path("toml", "# .gitignore"), "");
+    }
+    #[test]
+    fn images_blocked_only_for_a_running_model_without_vision() {
+        assert!(images_blocked(true, true, Some(false)));
+        assert!(!images_blocked(true, true, Some(true)));
+        // Still loading, /props unreadable, or not the app's own llama-server.
+        assert!(!images_blocked(true, true, None));
+        assert!(!images_blocked(true, false, Some(false)));
+        assert!(!images_blocked(false, true, Some(false)));
+    }
+    #[test]
+    fn ollama_models_match_with_or_without_tag() {
+        let models = vec![
+            "nomic-embed-text:latest".to_string(),
+            "qwen3-embedding:4b".to_string(),
+        ];
+        assert!(ollama_has(&models, "nomic-embed-text"));
+        assert!(ollama_has(&models, "nomic-embed-text:latest"));
+        assert!(ollama_has(&models, "Qwen3-Embedding:4b"));
+        assert!(!ollama_has(&models, "qwen3-embedding"));
+        assert!(!ollama_has(&models, ""));
+        assert!(!ollama_has(&[], "nomic-embed-text"));
     }
     #[test]
     fn attachments_by_extension_and_paste() {

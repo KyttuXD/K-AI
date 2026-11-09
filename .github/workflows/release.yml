@@ -29,6 +29,8 @@ env:
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
   RUST_BACKTRACE: short
+  # Discord voice: libopus is built from the sources in libopus_sys with CMake and linked statically (see build.yml).
+  LIBOPUS_BUNDLED: '1'
   TAG: ${{ inputs.tag || github.ref_name }}
 jobs:
   verify:
@@ -50,7 +52,7 @@ jobs:
           shared-key: lint
           save-if: false
       - name: Linux native dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends cmake pkg-config libssl-dev libwayland-dev libxkbcommon-dev
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -99,7 +101,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends cmake pkg-config libssl-dev libwayland-dev libxkbcommon-dev
       # The same profile as the package, so the tests and the app share one build of the dependencies.
       - name: Tests
         shell: bash
