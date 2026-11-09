@@ -17,8 +17,24 @@ rfd = "0.15"
 dirs = "6"
 similar = "2"
 tempfile = "3"
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "native_tls_backend"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+notify = "8"
+pdf-extract = "0.12"
+# DOCX reading only: inflate through flate2/zlib-rs, without the zopfli encoder that "deflate" adds.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# extract.rs uses the 0.41 API (events deref to bytes; 0.42 moved them to str).
+quick-xml = "0.41"
+# v1: the native stores (Windows Credential Manager, macOS Keychain, Secret Service over zbus in pure Rust).
+keyring = { version = "4", default-features = false, features = ["v1"] }
+base64 = "0.23"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+# Headless UI tests (src/ui): AccessKit tree, no GPU or window. Keep its version in step with eframe.
+egui_kittest = { version = "0.33", default-features = false, features = ["eframe"] }
 
 # Published builds (release.yml, scripts/package.*): smaller and faster, at the cost of a slower final link.
 [profile.release]

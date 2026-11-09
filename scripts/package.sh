@@ -8,6 +8,7 @@
 # fetched once into .llama/<artifact> (scripts/fetch-llama.sh).
 # MACOSX_DEPLOYMENT_TARGET defaults to 10.13 on Intel and 11.0 on Apple Silicon.
 #   scripts/package.sh --check-minos   only checks the minimum macOS versions of an existing dist/ (CI runs it)
+#   scripts/package.sh --summary       only writes test time, binary and package sizes to the CI job summary
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -57,10 +58,32 @@ check_dist_minos() {
     if file -b "$f" | grep -q Mach-O; then check_minos "$f" "$llama_min"; fi
   done < <(find "$app/Resources/llama" -type f)
 }
-if [[ "${1:-}" == --check-minos ]]; then
-  check_dist_minos
-  exit
-fi
+kib() { echo "$(($(wc -c < "$1") / 1024)) KiB"; }
+# Markdown for the CI job summary: the test time (TEST_SECONDS, set by the workflow), the binary size and the size of
+# each package in the project root.
+summary() {
+  local profile=${KYTTU_PROFILE:-release} dir bin f
+  dir=$profile
+  [[ "$profile" != dev ]] || dir=debug
+  bin="${CARGO_TARGET_DIR:-target}/$dir/kyttu-ai"
+  [[ -f "$bin" ]] || bin="$bin.exe"
+  printf '### %s (%s)\n\n| | |\n|---|---|\n' "$artifact" "$profile"
+  if [[ -n "${TEST_SECONDS:-}" ]]; then echo "| Tests | $TEST_SECONDS s |"; else echo "| Tests | did not finish |"; fi
+  if [[ -f "$bin" ]]; then echo "| Binary | $(kib "$bin") |"; fi
+  for f in kyttu-ai-*.zip kyttu-ai-*.dmg; do
+    if [[ -f "$f" ]]; then echo "| $f | $(kib "$f") |"; fi
+  done
+}
+case "${1:-}" in
+  --check-minos)
+    check_dist_minos
+    exit
+    ;;
+  --summary)
+    summary >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+    exit
+    ;;
+esac
 
 profile=${KYTTU_PROFILE:-release}
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)

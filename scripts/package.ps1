@@ -1,4 +1,5 @@
-# Builds KYTTU - AI and packages it into dist/: "KYTTU - AI.exe", README.md and llama/ (llama-server and its DLLs).
+# Builds KYTTU - AI and packages it into dist/: "KYTTU - AI.exe", README.md, llama/ (the Vulkan llama-server and its
+# DLLs) and llama/cpu/ (the CPU-only build, for machines without a usable GPU or AVX2).
 #   ./scripts/package.ps1                 release build (what release.yml publishes)
 #   ./scripts/package.ps1 -CargoProfile ci   the profile build.yml tests with, so its dependencies are reused
 #   ./scripts/package.ps1 -Dev            debug build
@@ -23,7 +24,8 @@ try {
         Write-Output 'KYTTU_SKIP_LLAMA=1: packaged without llama-server'
     } else {
         $llamaDir = if ($env:KYTTU_LLAMA_DIR) { $env:KYTTU_LLAMA_DIR } else { Join-Path $projectRoot '.llama\windows-x64' }
-        if (-not (Test-Path -LiteralPath (Join-Path $llamaDir 'llama-server.exe'))) {
+        if (-not (Test-Path -LiteralPath (Join-Path $llamaDir 'llama-server.exe')) -or
+            -not (Test-Path -LiteralPath (Join-Path $llamaDir 'cpu\llama-server.exe'))) {
             & (Join-Path $PSScriptRoot 'fetch-llama.ps1') 'windows-x64' $llamaDir
         }
         $llamaOut = Join-Path $outputFolder 'llama'

@@ -87,7 +87,12 @@ pub fn report() -> String {
         os_version().map(|v| format!(", {v}")).unwrap_or_default(),
         dir.join("settings.json").display(),
     );
-    for name in ["crash.log", "llama-server.log", "llama-server.prev.log"] {
+    for name in [
+        "crash.log",
+        "llama-server.log",
+        "llama-server.prev.log",
+        "llama-embed.log",
+    ] {
         match read_tail(&dir.join(name), TAIL_BYTES) {
             Some(text) => {
                 out.push_str(&format!("\n--- {name} (last {TAIL_LINES} lines) ---\n"));
@@ -102,6 +107,32 @@ pub fn report() -> String {
         Some(home) => shorten_home(&out, &home),
         None => out,
     }
+}
+
+/// The file manager command that opens a folder on this platform.
+fn file_manager() -> &'static str {
+    if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    }
+}
+
+/// Opens data_dir() (crash.log, llama-server.log and .prev.log) in the file manager.
+pub fn open_logs_folder() -> std::io::Result<()> {
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir)?;
+    let mut child = std::process::Command::new(file_manager())
+        .arg(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    // Reaped in the background so no zombie is left on Unix.
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 fn read_tail(path: &Path, max: u64) -> Option<String> {

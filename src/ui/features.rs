@@ -1,4 +1,8 @@
 use super::*;
+use crate::core::{
+    personas::{LoreEntry, MAX_LORE, MAX_LORE_TEXT, MAX_NOTE, MAX_NOTES},
+    secrets,
+};
 use crate::integrations::discord::{self, BotProfile, MemoryScope};
 use std::collections::{HashMap, HashSet};
 
@@ -92,6 +96,14 @@ impl Studio {
                                         .char_limit(64),
                                 );
                                 ui.checkbox(&mut persona.in_group, "In group chats");
+                                ui.add(
+                                    egui::DragValue::new(&mut persona.turn_order)
+                                        .range(-99..=99)
+                                        .prefix("Turn "),
+                                )
+                                .on_hover_text(
+                                    "Group chat order: lower goes first; ties keep list order.",
+                                );
                                 ui.checkbox(&mut persona.discord, "Available on Discord")
                                     .on_hover_text(
                                         "Only these characters can be called by Discord bots.",
@@ -104,6 +116,25 @@ impl Studio {
                                     .desired_width(f32::INFINITY)
                                     .char_limit(4000),
                             );
+                            egui::CollapsingHeader::new(
+                                RichText::new(format!("Lorebook ({})", persona.lorebook.len()))
+                                    .size(12.0),
+                            )
+                            .id_salt(("lorebook", i))
+                            .show(ui, |ui| lore_editor(ui, i, &mut persona.lorebook))
+                            .header_response
+                            .on_hover_text(
+                                "Entries whose keys appear in the latest message join this \
+                                 character's prompt (up to 1500 characters).",
+                            );
+                            egui::CollapsingHeader::new(
+                                RichText::new(format!("Memory ({})", persona.memory.len()))
+                                    .size(12.0),
+                            )
+                            .id_salt(("persona_memory", i))
+                            .show(ui, |ui| notes_editor(ui, i, &mut persona.memory))
+                            .header_response
+                            .on_hover_text("Notes this character always keeps in mind.");
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("Model");
                                 egui::ComboBox::from_id_salt(("persona_model", i))
@@ -232,12 +263,13 @@ impl Studio {
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new(
-                                "Create a bot, enable Message Content Intent, invite it with \
-                                 View Channel and Send Messages, and paste its channel IDs. Each \
-                                 bot only answers prefixed messages in its channels and only \
-                                 calls characters marked Available on Discord. Code tools and \
-                                 web search are off. Reconnect after changing characters or \
-                                 models.",
+                                "Create a bot, enable Message Content Intent, invite it with the \
+                                 bot and applications.commands scopes plus View Channel and Send \
+                                 Messages, and paste its channel IDs. Each bot only answers \
+                                 prefixed messages and /ask, /group, /stop, /reset in its \
+                                 channels, and only calls characters marked Available on \
+                                 Discord. Code tools and web search are off. Reconnect after \
+                                 changing characters or models.",
                             )
                             .size(12.0)
                             .color(MUTED),
@@ -252,7 +284,8 @@ impl Studio {
                             .first()
                             .map_or("!ai", |b| b.prefix.as_str());
                         ui.monospace(format!(
-                            "{p} hello\n{p} @Name review this idea\n{p} group brainstorm a feature"
+                            "{p} hello\n{p} @Name review this idea\n{p} group brainstorm a feature\n\
+                             /ask question: hello character: Name"
                         ));
                     });
                 if let Some(a) = action {
@@ -315,17 +348,26 @@ impl Studio {
             .unwrap_or_default();
         let confirm_id = egui::Id::new("confirm_remove_bot");
         let confirming = ui.data(|d| d.get_temp::<usize>(confirm_id)) == Some(i);
+        // Keychain work runs after the card, with the bot's name at that moment.
+        let mut forget = false;
         Self::card(ui, |ui| {
             let bot = &mut self.config.discord_bots[i];
             ui.horizontal(|ui| {
+                // Keychain entries are keyed by the name, so it is fixed while they are kept.
+                let remember = bot.remember;
                 ui.add_enabled(
-                    !running,
+                    !running && !remember,
                     egui::TextEdit::singleline(&mut bot.name)
                         .hint_text("Bot name")
                         .font(egui::TextStyle::Heading)
                         .desired_width(200.0)
                         .char_limit(40),
-                );
+                )
+                .on_disabled_hover_text(if remember {
+                    "Turn off Remember to rename"
+                } else {
+                    "Disconnect to rename"
+                });
                 ui.label(RichText::new(&status).color(ACCENT).size(12.0));
             });
             ui.add_enabled_ui(!running, |ui| {
@@ -333,8 +375,23 @@ impl Studio {
                     egui::TextEdit::singleline(&mut self.discord_tokens[i])
                         .password(true)
                         .desired_width(f32::INFINITY)
-                        .hint_text("Bot token (kept in memory only)"),
+                        .hint_text(if bot.remember {
+                            "Bot token (blank = use the saved one)"
+                        } else {
+                            "Bot token (kept in memory only)"
+                        }),
                 );
+                if ui
+                    .checkbox(&mut bot.remember, "Remember in system keychain")
+                    .on_hover_text(
+                        "Saves the token and webhooks in the OS keychain on Connect, never in \
+                         settings. Turning this off deletes them.",
+                    )
+                    .changed()
+                    && !bot.remember
+                {
+                    forget = true;
+                }
                 ui.label(RichText::new("Channel IDs").size(12.0).color(MUTED));
                 id_list(ui, egui::Id::new(("bot_channels", i)), &mut bot.channels, "Comma or newline separated");
                 ui.label(RichText::new("Server IDs (optional)").size(12.0).color(MUTED));
@@ -426,9 +483,15 @@ impl Studio {
                 } else if Self::primary(ui, "Connect").clicked() {
                     action = Some(BotAction::Connect(i));
                 }
-                if !running && ui.button("Clear credentials").clicked() {
+                if !running
+                    && ui
+                        .button("Clear credentials")
+                        .on_hover_text("Also deletes any saved in the keychain.")
+                        .clicked()
+                {
                     self.discord_tokens[i].clear();
                     self.discord_webhooks[i].clear();
+                    forget = bot.remember;
                 }
                 if confirming {
                     ui.label(RichText::new("Remove this bot?").color(ACCENT));
@@ -451,6 +514,13 @@ impl Studio {
                 }
             });
         });
+        if forget {
+            let name = self.config.discord_bots[i].name.clone();
+            self.persist();
+            if let Err(e) = forget_bot(&name) {
+                self.error = Some(e.to_string());
+            }
+        }
         action
     }
 
@@ -467,7 +537,12 @@ impl Studio {
                     .get(i)
                     .is_some_and(|s| !s.running.load(Ordering::Relaxed));
                 if idle && i < self.config.discord_bots.len() {
-                    self.config.discord_bots.remove(i);
+                    let bot = self.config.discord_bots.remove(i);
+                    if bot.remember
+                        && let Err(e) = forget_bot(&bot.name)
+                    {
+                        self.error = Some(e.to_string());
+                    }
                     self.discord_sessions.remove(i);
                     self.discord_tokens.remove(i);
                     self.discord_webhooks.remove(i);
@@ -483,15 +558,34 @@ impl Studio {
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("Unknown bot"))?;
                     check_profile(&profile, &self.config.discord_bots)?;
-                    let webhooks = parse_webhooks(&self.discord_webhooks[i])?;
+                    // Blank fields fall back to what the keychain holds for this bot.
+                    let (typed_token, typed_hooks) =
+                        (&self.discord_tokens[i], &self.discord_webhooks[i]);
+                    let saved = |typed: &str, key: String| {
+                        if profile.remember && typed.trim().is_empty() {
+                            secrets::get(&key).unwrap_or_default()
+                        } else {
+                            typed.to_owned()
+                        }
+                    };
+                    let token = saved(typed_token, discord::token_key(&profile.name));
+                    let hooks = saved(typed_hooks, discord::webhooks_key(&profile.name));
+                    let webhooks = parse_webhooks(&hooks)?;
+                    let (typed_token, typed_hooks) = (typed_token.clone(), typed_hooks.clone());
                     self.persist();
                     self.discord_sessions[i].connect(
-                        self.discord_tokens[i].clone(),
+                        token,
                         webhooks,
-                        profile,
+                        profile.clone(),
                         self.config.clone(),
                         self.library.clone(),
-                    )
+                    )?;
+                    if profile.remember {
+                        remember_bot(&profile.name, &typed_token, &typed_hooks).map_err(|e| {
+                            anyhow::anyhow!("Connected, but the keychain failed: {e}")
+                        })?;
+                    }
+                    Ok(())
                 })();
                 if let Err(e) = result {
                     self.error = Some(e.to_string());
@@ -520,6 +614,110 @@ fn id_list(ui: &mut egui::Ui, id: egui::Id, ids: &mut Vec<String>, hint: &str) {
         *ids = parse_ids(&text);
     }
     ui.data_mut(|d| d.insert_temp(id, text));
+}
+
+/// Lorebook entries of character `i`: keys and text, with add and remove.
+fn lore_editor(ui: &mut egui::Ui, i: usize, lore: &mut Vec<LoreEntry>) {
+    let mut remove = None;
+    for (j, entry) in lore.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            key_list(ui, egui::Id::new(("lore_keys", i, j)), &mut entry.keys);
+            if ui.small_button("Remove").clicked() {
+                remove = Some(j);
+            }
+        });
+        ui.add(
+            egui::TextEdit::multiline(&mut entry.text)
+                .hint_text("Text added when a key is mentioned")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .char_limit(MAX_LORE_TEXT),
+        );
+        ui.add_space(4.0);
+    }
+    if let Some(j) = remove {
+        lore.remove(j);
+    }
+    if lore.len() < MAX_LORE && ui.button("+ Entry").clicked() {
+        lore.push(LoreEntry::default());
+    }
+}
+
+/// Memory notes of character `i`, one line each.
+fn notes_editor(ui: &mut egui::Ui, i: usize, notes: &mut Vec<String>) {
+    let mut remove = None;
+    for (j, note) in notes.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(note)
+                    .id_salt(("persona_note", i, j))
+                    .hint_text("Something to remember")
+                    .desired_width((ui.available_width() - 70.0).max(120.0))
+                    .char_limit(MAX_NOTE),
+            );
+            if ui.small_button("Remove").clicked() {
+                remove = Some(j);
+            }
+        });
+    }
+    if let Some(j) = remove {
+        notes.remove(j);
+    }
+    if notes.len() < MAX_NOTES && ui.button("+ Note").clicked() {
+        notes.push(String::new());
+    }
+}
+
+/// Comma-separated lore keys. Like `id_list`, the raw text lives in egui memory so a trailing
+/// comma survives while typing.
+fn key_list(ui: &mut egui::Ui, id: egui::Id, keys: &mut Vec<String>) {
+    let mut text = ui
+        .data(|d| d.get_temp::<String>(id))
+        .filter(|t| parse_keys(t) == *keys)
+        .unwrap_or_else(|| keys.join(", "));
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .hint_text("Keys, comma separated")
+                .desired_width(260.0)
+                .char_limit(600),
+        )
+        .on_hover_text("Matched as whole words, ignoring case.")
+        .changed()
+    {
+        *keys = parse_keys(&text);
+    }
+    ui.data_mut(|d| d.insert_temp(id, text));
+}
+
+/// Splits lore keys on commas; trims, drops empties and case-insensitive duplicates, and keeps
+/// at most 20 keys of 64 characters.
+fn parse_keys(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in text.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        let key: String = key.chars().take(64).collect();
+        if out.len() < 20 && !out.iter().any(|o| o.to_lowercase() == key.to_lowercase()) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+/// Saves a bot's typed token and webhook lines in the keychain (blank fields are left as they
+/// are, since blank means "use the saved value").
+fn remember_bot(name: &str, token: &str, webhooks: &str) -> anyhow::Result<()> {
+    if !token.trim().is_empty() {
+        secrets::set(&discord::token_key(name), token.trim())?;
+    }
+    if !webhooks.trim().is_empty() {
+        secrets::set(&discord::webhooks_key(name), webhooks.trim())?;
+    }
+    Ok(())
+}
+
+fn forget_bot(name: &str) -> anyhow::Result<()> {
+    secrets::delete(&discord::token_key(name))?;
+    secrets::delete(&discord::webhooks_key(name))
 }
 
 fn scope_label(scope: &MemoryScope) -> &'static str {
@@ -725,6 +923,18 @@ mod tests {
         assert_eq!(name.chars().count(), 64);
         assert!(name.ends_with(" (2)"));
         assert_eq!(unique_name("  ", &HashSet::new()), "Character");
+    }
+
+    #[test]
+    fn parses_lore_keys() {
+        assert_eq!(
+            parse_keys(" Dragon, new york ,,dragon, "),
+            ["Dragon", "new york"]
+        );
+        assert!(parse_keys(" , ").is_empty());
+        let many: Vec<String> = (0..30).map(|n| n.to_string()).collect();
+        assert_eq!(parse_keys(&many.join(",")).len(), 20);
+        assert_eq!(parse_keys(&"k".repeat(80))[0].chars().count(), 64);
     }
 
     #[test]

@@ -5,6 +5,9 @@ updates:
     schedule:
       interval: weekly
     groups:
+      # egui_kittest has to match eframe's egui version, so they move in one pull request.
+      egui:
+        patterns: [eframe, egui*]
       cargo-minor:
         update-types: [minor, patch]
   # Actions are pinned to commit SHAs with a version comment; Dependabot bumps both.

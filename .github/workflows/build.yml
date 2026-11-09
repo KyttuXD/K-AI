@@ -3,7 +3,8 @@ name: Build
 # lint: fmt and clippy, once, on Linux. deny: cargo-deny (advisories, licenses, sources), also weekly.
 # native: tests on each system, in the ci profile (Cargo.toml). Pull requests test Windows, Linux x64 and Apple
 # Silicon and stop there; main and manual runs also test Linux ARM64 and Intel macOS, then build the package from the
-# same profile (the test build's dependencies are reused) with llama-server bundled, and upload it.
+# same profile (the test build's dependencies are reused) with llama-server bundled, and upload it. Each job's summary
+# shows the test time and, when packaged, the binary and package sizes.
 # Rust caches are saved by main's runs only; pull requests read them (GitHub scopes caches by branch).
 on:
   push:
@@ -45,7 +46,7 @@ jobs:
           shared-key: lint
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Linux native dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
 
@@ -69,7 +70,8 @@ jobs:
         # Pull requests: one system of each kind. main and manual runs: all five release targets.
         include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"artifact":"windows-x64","os":"windows-2025"},{"artifact":"linux-x64","os":"ubuntu-24.04"},{"artifact":"macos-arm64","os":"macos-15","macos_min":"11.0"}]' || '[{"artifact":"windows-x64","os":"windows-2025"},{"artifact":"linux-x64","os":"ubuntu-24.04"},{"artifact":"linux-arm64","os":"ubuntu-24.04-arm"},{"artifact":"macos-x64","os":"macos-15-intel","macos_min":"10.13"},{"artifact":"macos-arm64","os":"macos-15","macos_min":"11.0"}]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # 90: a cache miss on Intel macOS also builds llama-server with every CPU variant.
+    timeout-minutes: 90
     env:
       KYTTU_PROFILE: ci
       KYTTU_ARTIFACT: ${{ matrix.artifact }}
@@ -88,8 +90,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libwayland-dev libxkbcommon-dev
-      - run: cargo test --locked --profile ci
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
+      - name: Tests
+        shell: bash
+        run: |
+          start=$(date +%s)
+          cargo test --locked --profile ci
+          echo "TEST_SECONDS=$(($(date +%s) - start))" >> "$GITHUB_ENV"
 
       # Packaging (not on pull requests): llama-server is downloaded (or, for Intel macOS, built) once per llama.cpp
       # tag and kept in the Actions cache (the key hashes the fetch scripts, which pin the tag).
@@ -127,3 +134,7 @@ jobs:
           path: kyttu-ai-*.zip
           if-no-files-found: error
           retention-days: 14
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: bash scripts/package.sh --summary

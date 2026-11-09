@@ -1,9 +1,11 @@
 use super::*;
 
 /// Sidebar navigation: icon, label and the view index it opens.
-const NAV: [(&str, &str, usize); 5] = [
+const NAV: [(&str, &str, usize); 7] = [
     ("💬", "Chat", 0),
     ("📚", "Library", 1),
+    ("📦", "Models", 5),
+    ("🛠", "Workbench", 6),
     ("👥", "Characters", 4),
     ("🔌", "Connections", 2),
     ("⚙", "Settings", 3),
@@ -16,6 +18,10 @@ enum MessageAction {
     Resend(usize),
     CancelEdit,
     Select(usize),
+    Fork(usize),
+    Speak(usize),
+    Continue,
+    Apply(String, String),
 }
 enum Fix {
     Model,
@@ -25,11 +31,72 @@ enum Fix {
     Workspace,
     Docs,
 }
+/// What a chat list menu asks for.
+enum ChatAction {
+    Open(String),
+    Rename(String, String),
+    Pin(String),
+    Export(String),
+    Delete(String),
+}
+/// One row of the sidebar file list.
+enum FileRow<'a> {
+    Dir(&'a str, bool),
+    File(&'a str, &'a str, bool),
+}
 
 /// A frameless, muted text button used in message headers.
 fn quiet_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     let p = pal(ui.ctx());
     ui.add(egui::Button::new(RichText::new(text).size(11.0).color(p.muted)).frame(false))
+}
+
+/// Rough height of a message bubble that has not been laid out yet: header and margins plus
+/// about 19 px per wrapped line. Only stands in for messages far from the viewport.
+fn estimate_height(text: &str, width: f32) -> f32 {
+    let per_line = ((width - 58.0) / 7.5).max(20.0);
+    let rows: f32 = text
+        .lines()
+        .map(|l| (l.len() as f32 / per_line).ceil().max(1.0))
+        .sum();
+    44.0 + rows.max(1.0) * 19.0
+}
+
+/// "12.3 tok/s · 2.1k/8.2k ctx · 1.4 GB" for the composer's status line.
+fn metrics_text(m: &llama::Metrics) -> String {
+    let k = |n: usize| {
+        if n >= 1000 {
+            format!("{:.1}k", n as f64 / 1000.0)
+        } else {
+            n.to_string()
+        }
+    };
+    let mut parts = vec![];
+    if let Some(speed) = m.tokens_per_sec.filter(|s| s.is_finite() && *s > 0.0) {
+        parts.push(format!("{speed:.1} tok/s"));
+    }
+    if m.ctx_total > 0 {
+        parts.push(format!("{}/{} ctx", k(m.ctx_used), k(m.ctx_total)));
+    }
+    if m.ram_mb > 0 {
+        parts.push(if m.ram_mb >= 1024 {
+            format!("{:.1} GB", m.ram_mb as f64 / 1024.0)
+        } else {
+            format!("{} MB", m.ram_mb)
+        });
+    }
+    parts.join(" · ")
+}
+
+/// Environment variable names typed one per line (or separated by commas or spaces).
+fn parse_names(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = text
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .collect();
+    names.dedup();
+    names
 }
 
 impl Studio {
@@ -152,7 +219,13 @@ impl Studio {
                     }))
                     .fill(if selected { p.selected } else { p.panel })
                     .corner_radius(6);
-                    if ui.add_sized([width, 28.0], button).clicked() {
+                    let response = ui.add_sized([width, 28.0], button);
+                    let response = if view == 6 {
+                        response.on_hover_text("Editor, git and terminal · Ctrl+P opens a file")
+                    } else {
+                        response
+                    };
+                    if response.clicked() {
                         self.view = view;
                     }
                 }
@@ -239,20 +312,32 @@ impl Studio {
         }
         let query = self.conversation_search.trim().to_lowercase();
         let idle = self.worker.is_none();
-        let (mut open, mut delete, mut rename, mut renamed) = (None, None, None, None);
+        let pins = &self.config.pinned_conversations;
+        // Matching rows, pinned first (in pin order), then newest first.
+        let mut rows: Vec<usize> = (0..self.conversations.len())
+            .filter(|&i| {
+                query.is_empty() || self.conversations[i].title.to_lowercase().contains(&query)
+            })
+            .collect();
+        rows.sort_by_key(|&i| {
+            pins.iter()
+                .position(|p| *p == self.conversations[i].id)
+                .unwrap_or(usize::MAX)
+        });
+        let pinned: std::collections::HashSet<&str> = pins.iter().map(String::as_str).collect();
+        let (mut action, mut renamed) = (None, None);
+        if self.conversations.is_empty() {
+            ui.label(RichText::new("No saved chats").size(11.5).color(p.muted));
+        }
+        let row_height = ui.spacing().interact_size.y.max(24.0);
         egui::ScrollArea::vertical()
             .id_salt("chats")
             .max_height(max_height)
             .auto_shrink([false, true])
-            .show(ui, |ui| {
+            .show_rows(ui, row_height, rows.len(), |ui, range| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                if self.conversations.is_empty() {
-                    ui.label(RichText::new("No saved chats").size(11.5).color(p.muted));
-                }
-                for meta in &self.conversations {
-                    if !query.is_empty() && !meta.title.to_lowercase().contains(&query) {
-                        continue;
-                    }
+                for &i in &rows[range] {
+                    let meta = &self.conversations[i];
                     if let Some((id, text)) = &mut self.renaming
                         && *id == meta.id
                     {
@@ -267,17 +352,22 @@ impl Studio {
                         continue;
                     }
                     let selected = meta.id == self.conversation.id;
+                    let is_pinned = pinned.contains(meta.id.as_str());
                     ui.horizontal(|ui| {
-                        let button = egui::Button::new(
-                            RichText::new(&meta.title).size(12.5).color(if selected {
+                        let title = if is_pinned {
+                            format!("📌 {}", meta.title)
+                        } else {
+                            meta.title.clone()
+                        };
+                        let button =
+                            egui::Button::new(RichText::new(title).size(12.5).color(if selected {
                                 p.accent
                             } else {
                                 p.text
-                            }),
-                        )
-                        .fill(if selected { p.selected } else { p.panel })
-                        .corner_radius(6)
-                        .truncate();
+                            }))
+                            .fill(if selected { p.selected } else { p.panel })
+                            .corner_radius(6)
+                            .truncate();
                         let response = ui
                             .add_enabled_ui(idle || selected, |ui| {
                                 ui.add_sized([(width - 26.0).max(40.0), 24.0], button)
@@ -285,15 +375,24 @@ impl Studio {
                             .inner
                             .on_hover_text(&meta.title);
                         if response.clicked() {
-                            open = Some(meta.id.clone());
+                            action = Some(ChatAction::Open(meta.id.clone()));
                         }
                         ui.menu_button(RichText::new("…").color(p.muted), |ui| {
                             if ui.button("Rename").clicked() {
-                                rename = Some((meta.id.clone(), meta.title.clone()));
+                                action =
+                                    Some(ChatAction::Rename(meta.id.clone(), meta.title.clone()));
+                                ui.close();
+                            }
+                            if ui.button(if is_pinned { "Unpin" } else { "Pin" }).clicked() {
+                                action = Some(ChatAction::Pin(meta.id.clone()));
+                                ui.close();
+                            }
+                            if ui.button("Export as Markdown…").clicked() {
+                                action = Some(ChatAction::Export(meta.id.clone()));
                                 ui.close();
                             }
                             if ui.add_enabled(idle, egui::Button::new("Delete")).clicked() {
-                                delete = Some(meta.id.clone());
+                                action = Some(ChatAction::Delete(meta.id.clone()));
                                 ui.close();
                             }
                         });
@@ -306,84 +405,154 @@ impl Studio {
                 self.rename_conversation(&id, title);
             }
         }
-        if rename.is_some() {
-            self.renaming = rename;
-        }
-        if let Some(id) = open {
-            self.open_conversation(&id);
-        }
-        if let Some(id) = delete {
-            self.delete_conversation(&id);
+        match action {
+            Some(ChatAction::Open(id)) => self.open_conversation(&id),
+            Some(ChatAction::Rename(id, title)) => self.renaming = Some((id, title)),
+            Some(ChatAction::Pin(id)) => self.toggle_pin(&id),
+            Some(ChatAction::Export(id)) => self.export_markdown(&id),
+            Some(ChatAction::Delete(id)) => self.delete_conversation(&id),
+            None => {}
         }
     }
 
     fn project_files(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui.ctx());
+        let idle = self.worker.is_none();
         ui.horizontal(|ui| {
             Self::eyebrow(ui, "PROJECT");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled_ui(self.worker.is_none(), |ui| {
+                ui.add_enabled_ui(idle, |ui| {
                     if ui.small_button("Open…").on_hover_text("Ctrl+O").clicked() {
                         self.choose_workspace();
                     }
                 });
             });
         });
-        ui.add(
-            egui::Label::new(
-                RichText::new(
-                    self.config
-                        .workspace
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                )
-                .strong(),
-            )
-            .truncate(),
-        )
+        // The project name opens the recent projects.
+        let name = self
+            .config
+            .workspace
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let mut switch = None;
+        let mut clear = false;
+        ui.menu_button(RichText::new(format!("{name} ▾")).strong(), |ui| {
+            let recent: Vec<&PathBuf> = self
+                .config
+                .projects
+                .iter()
+                .filter(|path| **path != self.config.workspace)
+                .collect();
+            if recent.is_empty() {
+                ui.label(
+                    RichText::new("No recent projects")
+                        .size(12.0)
+                        .color(p.muted),
+                );
+            }
+            for path in recent {
+                let label = path.file_name().unwrap_or_default().to_string_lossy();
+                let exists = path.is_dir();
+                if ui
+                    .add_enabled(idle && exists, egui::Button::new(&*label))
+                    .on_hover_text(path.display().to_string())
+                    .on_disabled_hover_text(if exists {
+                        "Wait for the reply to finish."
+                    } else {
+                        "This folder no longer exists."
+                    })
+                    .clicked()
+                {
+                    switch = Some(path.clone());
+                    ui.close();
+                }
+            }
+            if !self.config.projects.is_empty() {
+                ui.separator();
+                if ui.button("Clear list").clicked() {
+                    clear = true;
+                    ui.close();
+                }
+            }
+        })
+        .response
         .on_hover_text(self.config.workspace.display().to_string());
-        let mut clicked = None;
+        if let Some(path) = switch {
+            self.open_workspace(path);
+        }
+        if clear {
+            self.config.projects.clear();
+        }
+        // Flat rows (root files, then folders with their files when expanded), virtualized.
+        let mut rows = vec![];
+        for (dir, items) in &self.file_groups {
+            let open = dir.is_empty() || self.open_dirs.contains(dir);
+            if !dir.is_empty() {
+                rows.push(FileRow::Dir(dir, open));
+            }
+            if open {
+                rows.extend(
+                    items
+                        .iter()
+                        .map(|(n, full)| FileRow::File(n, full, !dir.is_empty())),
+                );
+            }
+        }
+        let (mut clicked, mut toggle) = (None, None);
+        if self.files.is_empty() {
+            ui.label(RichText::new("No files").size(11.5).color(p.muted));
+        }
+        let row_height = ui.spacing().interact_size.y;
         egui::ScrollArea::vertical()
             .id_salt("files")
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_rows(ui, row_height, rows.len(), |ui, range| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                let file_button = |ui: &mut egui::Ui, name: &str, full: &str| {
-                    ui.add(
-                        egui::Button::new(RichText::new(name).size(11.5).color(p.muted))
-                            .frame(false)
-                            .truncate(),
-                    )
-                    .on_hover_text(full)
-                    .clicked()
-                };
-                for (dir, items) in &self.file_groups {
-                    if dir.is_empty() {
-                        for (name, full) in items {
-                            if file_button(ui, name, full) {
-                                clicked = Some(full.clone());
+                for row in &rows[range] {
+                    match *row {
+                        FileRow::Dir(dir, open) => {
+                            let text = format!("{} {dir}/", if open { "▾" } else { "▸" });
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new(text).size(11.5).color(p.text))
+                                        .frame(false)
+                                        .truncate(),
+                                )
+                                .clicked()
+                            {
+                                toggle = Some(dir.to_owned());
                             }
                         }
-                    } else {
-                        egui::CollapsingHeader::new(
-                            RichText::new(format!("{dir}/")).size(11.5).color(p.text),
-                        )
-                        .id_salt(("dir", dir))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            for (name, full) in items {
-                                if file_button(ui, name, full) {
-                                    clicked = Some(full.clone());
+                        FileRow::File(name, full, nested) => {
+                            ui.horizontal(|ui| {
+                                if nested {
+                                    ui.add_space(12.0);
                                 }
-                            }
-                        });
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(name).size(11.5).color(p.muted),
+                                        )
+                                        .frame(false)
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(full)
+                                    .clicked()
+                                {
+                                    clicked = Some(full.to_owned());
+                                }
+                            });
+                        }
                     }
                 }
-                if self.files.is_empty() {
-                    ui.label(RichText::new("No files").size(11.5).color(p.muted));
-                }
             });
+        if let Some(dir) = toggle
+            && !self.open_dirs.remove(&dir)
+        {
+            self.open_dirs.insert(dir);
+        }
         if let Some(file) = clicked {
             let text = tools::read(&self.config.workspace, &file).unwrap_or_else(|e| e.to_string());
             self.preview = Some((file, text));
@@ -462,10 +631,14 @@ impl Studio {
     pub(super) fn conversation_ui(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui.ctx());
         let idle = self.worker.is_none();
+        let mut entered_code = false;
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(idle, |ui| {
                 ui.selectable_value(&mut self.coding, false, "Chat");
-                ui.selectable_value(&mut self.coding, true, "Code");
+                // Chat replies no longer re-list the workspace, so catch up on entering Code.
+                entered_code = ui
+                    .selectable_value(&mut self.coding, true, "Code")
+                    .changed();
                 ui.separator();
                 egui::ComboBox::from_id_salt("model")
                     .selected_text(if self.config.model.is_empty() || self.models.is_empty() {
@@ -500,9 +673,18 @@ impl Studio {
                         .on_hover_text("Character");
                 }
                 ui.menu_button("Options", |ui| {
-                    ui.checkbox(&mut self.use_docs, "Use documentation");
-                    ui.checkbox(&mut self.use_embeddings, "Embedding rerank")
-                        .on_hover_text("Rerank document matches with the Ollama embedding model chosen in Settings.");
+                    let docs_toggled = ui
+                        .checkbox(&mut self.use_docs, "Use documentation")
+                        .changed();
+                    let rerank_toggled = ui
+                        .checkbox(&mut self.use_embeddings, "Embedding rerank")
+                        .on_hover_text(
+                            "Rerank document matches with the embedding model chosen in Settings.",
+                        )
+                        .changed();
+                    if (docs_toggled || rerank_toggled) && self.use_docs && self.use_embeddings {
+                        crate::knowledge::embeddings::prewarm(&self.config);
+                    }
                     ui.checkbox(&mut self.use_web, "Web search")
                         .on_hover_text("Sends search queries to DuckDuckGo.");
                     ui.add_enabled(
@@ -535,6 +717,9 @@ impl Studio {
                 }
             });
         });
+        if entered_code {
+            self.refresh_files();
+        }
         ui.add_space(4.0);
 
         // One enclosed chat box: messages on top, the composer docked at its bottom.
@@ -644,29 +829,30 @@ impl Studio {
         });
     }
 
-    /// First-run checklist shown in the empty chat while no model answers.
+    /// First-run checklist shown in the empty chat while no model answers. File checks
+    /// come from `paths_ok`, refreshed every few seconds, not from a stat per frame.
     fn setup_checklist(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui.ctx());
         let direct = self.config.direct_backend;
-        let model_ok = self.config.gguf_model.is_file();
+        let [model_ok, workspace_ok, docs_ok] = self.paths_ok;
         let server_ok = self.server_found.is_some();
-        let busy = self.llama_busy || self.setup.is_some();
+        let working = self.llama_busy || self.setup.is_some();
         let mut rows: Vec<(bool, &str, &str, Fix, bool)> = vec![];
         if direct {
-            rows.push((model_ok, "Model file", "Choose…", Fix::Model, !busy));
+            rows.push((model_ok, "Model file", "Choose…", Fix::Model, !working));
             rows.push((
                 server_ok,
                 "llama-server found",
                 "Choose…",
                 Fix::Server,
-                !busy,
+                !working,
             ));
             rows.push((
                 self.online || self.llama.running(),
                 "Model running",
                 "Start",
                 Fix::Start,
-                model_ok && server_ok && !busy,
+                model_ok && server_ok && !working,
             ));
         } else {
             rows.push((
@@ -678,19 +864,13 @@ impl Studio {
             ));
         }
         rows.push((
-            self.config.workspace.is_dir(),
+            workspace_ok,
             "Workspace",
             "Open…",
             Fix::Workspace,
             self.worker.is_none(),
         ));
-        rows.push((
-            self.config.docs.is_dir(),
-            "Docs folder (optional)",
-            "Choose…",
-            Fix::Docs,
-            true,
-        ));
+        rows.push((docs_ok, "Documentation (optional)", "Add…", Fix::Docs, true));
         let mut fix = None;
         let mut auto = false;
         let width = ui.available_width().min(440.0);
@@ -738,7 +918,7 @@ impl Studio {
                     } else if self.llama_busy {
                         ui.separator();
                         ui.horizontal(|ui| {
-                            ui.spinner();
+                            busy(ui);
                             ui.label(RichText::new("Loading model…").color(p.muted));
                         });
                     } else if direct && (!model_ok || !server_ok) {
@@ -765,7 +945,7 @@ impl Studio {
             Some(Fix::Start) => self.start_llama(),
             Some(Fix::Ollama) => self.start_ollama(),
             Some(Fix::Workspace) => self.choose_workspace(),
-            Some(Fix::Docs) => self.choose_docs(),
+            Some(Fix::Docs) => self.view = 1,
             None => {}
         }
     }
@@ -780,7 +960,7 @@ impl Studio {
     fn choose_server(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_file() {
             self.config.llama_server = path;
-            self.server_found = llama::find_server(&self.config);
+            self.rescan_server();
             self.persist();
         }
     }
@@ -789,6 +969,9 @@ impl Studio {
         let p = pal(ui.ctx());
         let count = self.conversation.messages.len();
         let idle = self.worker.is_none();
+        let can_apply = idle && self.coding;
+        let can_continue = idle && self.can_continue;
+        let speaking = self.speaking;
         let mut action = None;
         for i in 0..count {
             let editing = matches!(&self.editing, Some((e, _)) if *e == i);
@@ -796,19 +979,38 @@ impl Studio {
             // Off-screen messages with a known size are skipped, keeping only their space.
             let y = ui.cursor().top() - origin;
             let size = m.cache.size;
-            let fresh = m.cache.parsed_len == Some(m.text.len());
-            if size.y > 0.0
-                && fresh
-                && !editing
-                && (y + size.y < viewport.min.y - 400.0 || y > viewport.max.y + 400.0)
-            {
+            let measured = m.cache.measured_len == Some(m.text.len());
+            let far = |h: f32| y + h < viewport.min.y - 400.0 || y > viewport.max.y + 400.0;
+            if size.y > 0.0 && measured && !editing && far(size.y) {
                 ui.allocate_exact_size(egui::vec2(size.x.min(width), size.y), egui::Sense::hover());
                 ui.add_space(8.0);
+                // Its parse is rebuilt when it scrolls back, so long chats stay small.
+                m.free_blocks();
                 continue;
+            }
+            // A just-opened chat has no sizes yet: messages far from view get an estimate
+            // (not stored) instead of a full parse and layout on the first frame; each is
+            // measured when it comes within reach of the viewport.
+            if m.cache.measured_len.is_none() && !editing {
+                let len = m.text.len();
+                let estimate = match m.cache.estimate {
+                    Some((l, w, h)) if l == len && w == width => h,
+                    _ => {
+                        let h = estimate_height(&m.text, width);
+                        m.cache.estimate = Some((len, width, h));
+                        h
+                    }
+                };
+                if far(estimate) {
+                    ui.allocate_exact_size(egui::vec2(width - 2.0, estimate), egui::Sense::hover());
+                    ui.add_space(8.0);
+                    continue;
+                }
             }
             let blocks = m.blocks();
             let mine = m.role == "You";
-            let streaming = !idle && i + 1 == count;
+            let last = i + 1 == count;
+            let streaming = !idle && last;
             let selected = self.selected_message == Some(i);
             let response = egui::Frame::new()
                 .fill(if mine { p.user_bubble } else { p.card })
@@ -831,18 +1033,51 @@ impl Studio {
                             p.muted
                         }));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if idle {
+                                ui.menu_button(
+                                    RichText::new("…").size(11.0).color(p.muted),
+                                    |ui| {
+                                        if ui
+                                            .button("Fork from here")
+                                            .on_hover_text(
+                                                "Start a new chat with the messages up to this one",
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(MessageAction::Fork(i));
+                                            ui.close();
+                                        }
+                                    },
+                                );
+                            }
                             if !m.text.is_empty() && quiet_button(ui, "Copy").clicked() {
                                 ui.ctx().copy_text(m.text.clone());
+                            }
+                            if !mine && !m.text.is_empty() && !streaming {
+                                let label = if speaking == Some(i) { "Stop" } else { "Speak" };
+                                if quiet_button(ui, label)
+                                    .on_hover_text("Read aloud with the system voice")
+                                    .clicked()
+                                {
+                                    action = Some(MessageAction::Speak(i));
+                                }
                             }
                             if idle && mine && !editing && quiet_button(ui, "Edit").clicked() {
                                 action = Some(MessageAction::Edit(i));
                             }
-                            if idle
-                                && !mine
-                                && i + 1 == count
-                                && quiet_button(ui, "Regenerate").clicked()
-                            {
+                            if idle && !mine && last && quiet_button(ui, "Regenerate").clicked() {
                                 action = Some(MessageAction::Regenerate);
+                            }
+                            if can_continue
+                                && !mine
+                                && last
+                                && quiet_button(ui, "Continue")
+                                    .on_hover_text(
+                                        "The run stopped early; resume where it left off",
+                                    )
+                                    .clicked()
+                            {
+                                action = Some(MessageAction::Continue);
                             }
                             if !m.sources.is_empty()
                                 && quiet_button(ui, &format!("Sources ({})", m.sources.len()))
@@ -852,6 +1087,13 @@ impl Studio {
                             }
                         });
                     });
+                    if !m.images.is_empty() {
+                        ui.label(
+                            RichText::new(format!("🖼 {}", m.images.join(", ")))
+                                .size(11.5)
+                                .color(p.muted),
+                        );
+                    }
                     if let Some((_, text)) = self.editing.as_mut().filter(|_| editing) {
                         ui.add(
                             egui::TextEdit::multiline(text)
@@ -873,15 +1115,18 @@ impl Studio {
                         });
                     } else if m.text.is_empty() && streaming {
                         ui.horizontal(|ui| {
-                            ui.spinner();
+                            busy(ui);
                             ui.label(RichText::new(&self.status).color(p.muted));
                         });
-                    } else {
-                        render_blocks(ui, &blocks, i);
+                    } else if let Some((path, code)) =
+                        render_blocks(ui, &blocks, i, can_apply && !mine)
+                    {
+                        action = Some(MessageAction::Apply(path, code));
                     }
                 })
                 .response;
             m.cache.size = response.rect.size();
+            m.cache.measured_len = Some(m.text.len());
             ui.add_space(8.0);
         }
         match action {
@@ -899,6 +1144,10 @@ impl Studio {
                 self.selected_message = (self.selected_message != Some(i)).then_some(i);
                 self.config.show_inspector = true;
             }
+            Some(MessageAction::Fork(i)) => self.fork_conversation(i),
+            Some(MessageAction::Speak(i)) => self.speak(i),
+            Some(MessageAction::Continue) => self.continue_run(),
+            Some(MessageAction::Apply(path, code)) => self.apply_draft = Some((path, code)),
             None => {}
         }
     }
@@ -924,14 +1173,64 @@ impl Studio {
         let p = pal(ui.ctx());
         let id = egui::Id::new("draft_input");
         let idle = self.worker.is_none();
+        let focused = ui.memory(|m| m.has_focus(id));
+        // Pasted image file paths become attachments instead of text.
+        let pasted: Vec<PathBuf> = if focused {
+            ui.input_mut(|i| {
+                let mut found = vec![];
+                i.events.retain(|e| match e {
+                    egui::Event::Paste(text) => match pasted_images(text) {
+                        Some(paths) => {
+                            found.extend(paths);
+                            false
+                        }
+                        None => true,
+                    },
+                    _ => true,
+                });
+                found
+            })
+        } else {
+            vec![]
+        };
+        if !pasted.is_empty() {
+            self.attach_paths(pasted);
+        }
         // Enter sends and Shift+Enter adds a line: take Enter before the text box sees it.
         let submit = idle
             && self.online
-            && ui.memory(|m| m.has_focus(id))
+            && focused
             && ui.input_mut(|i| {
                 (!i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                     || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)
             });
+        if !self.attachments.is_empty() || self.transcribing {
+            let mut remove = None;
+            ui.horizontal_wrapped(|ui| {
+                for (n, a) in self.attachments.iter().enumerate() {
+                    egui::Frame::new()
+                        .fill(p.panel)
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(6, 2))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("🖼 {}", a.name)).size(11.5))
+                                    .on_hover_text(format!("{} KB", a.bytes.len() / 1024));
+                                if quiet_button(ui, "×").on_hover_text("Remove").clicked() {
+                                    remove = Some(n);
+                                }
+                            });
+                        });
+                }
+                if self.transcribing {
+                    busy(ui);
+                    ui.label(RichText::new("Transcribing…").size(11.5).color(p.muted));
+                }
+            });
+            if let Some(n) = remove {
+                self.attachments.remove(n);
+            }
+        }
         egui::ScrollArea::vertical()
             .id_salt("draft")
             .max_height(160.0)
@@ -946,8 +1245,14 @@ impl Studio {
                 );
             });
         let mut send = submit;
-        let mut stop = false;
+        let (mut stop, mut attach) = (false, false);
         ui.horizontal(|ui| {
+            attach = ui
+                .add_enabled(idle, egui::Button::new("📎").frame(false))
+                .on_hover_text(
+                    "Attach images (PNG, JPEG, WebP) for a vision model, or audio to transcribe into the message. Images can also be dropped or pasted as files.",
+                )
+                .clicked();
             ui.add(
                 egui::Label::new(RichText::new(&self.status).size(11.0).color(p.muted)).truncate(),
             );
@@ -965,133 +1270,23 @@ impl Studio {
                         .on_disabled_hover_text(blocked.unwrap_or_default())
                         .clicked();
                 }
+                if let Some(m) = &self.metrics {
+                    let text = metrics_text(m);
+                    if !text.is_empty() {
+                        ui.label(RichText::new(text).size(11.0).color(p.muted))
+                            .on_hover_text("Generation speed · context in use · llama-server memory");
+                    }
+                }
             });
         });
+        if attach {
+            self.choose_attachments();
+        }
         if stop {
             self.stop();
         } else if send {
             self.send();
         }
-    }
-
-    pub(super) fn library_ui(&mut self, ui: &mut egui::Ui) {
-        let pl = pal(ui.ctx());
-        Self::page_title(ui, "Library");
-        let p = self.library.progress.lock().unwrap().clone();
-        let mut choose = false;
-        Self::card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!("{} files · {} passages", p.files, p.chunks)).strong(),
-                )
-                .on_hover_text("Markdown, MDX, text, RST, AsciiDoc and HTML are indexed.");
-                if p.running {
-                    ui.spinner();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    choose = ui
-                        .add_enabled(
-                            !p.running && self.worker.is_none(),
-                            egui::Button::new("Choose folder…"),
-                        )
-                        .clicked();
-                    if ui
-                        .add_enabled(!p.running, egui::Button::new("Rebuild"))
-                        .clicked()
-                    {
-                        self.library.rebuild(self.config.docs.clone());
-                    }
-                });
-            });
-            ui.label(
-                RichText::new(self.config.docs.display().to_string())
-                    .size(11.5)
-                    .color(pl.muted),
-            );
-            let mut note = p.message.clone();
-            if p.skipped > 0 {
-                note.push_str(&format!(" · {} skipped", p.skipped));
-            }
-            if !note.trim().is_empty() {
-                ui.label(RichText::new(note).size(11.5).color(pl.muted));
-            }
-            if !p.skipped_files.is_empty() {
-                egui::CollapsingHeader::new(format!("Skipped files ({})", p.skipped))
-                    .id_salt("skipped_files")
-                    .show(ui, |ui| {
-                        for (path, reason) in &p.skipped_files {
-                            ui.label(
-                                RichText::new(format!("{path}: {reason}"))
-                                    .size(11.5)
-                                    .color(pl.muted),
-                            );
-                        }
-                        if p.skipped > p.skipped_files.len() {
-                            ui.label(
-                                RichText::new(format!(
-                                    "…and {} more",
-                                    p.skipped - p.skipped_files.len()
-                                ))
-                                .size(11.5)
-                                .color(pl.muted),
-                            );
-                        }
-                    });
-            }
-        });
-        if choose {
-            self.choose_docs();
-        }
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .hint_text(if self.pack.is_empty() {
-                        "Search documentation".to_owned()
-                    } else {
-                        format!("Search {}", self.pack)
-                    })
-                    .desired_width((ui.available_width() - 80.0).max(100.0)),
-            );
-            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("Search").clicked() || enter {
-                if self.library.matches_root(&self.config.docs) {
-                    match self.library.search(&self.search, &self.pack, 8) {
-                        Ok(s) => self.search_results = s,
-                        Err(e) => self.error = Some(e.to_string()),
-                    }
-                } else {
-                    self.error = Some("Wait for the index to finish for this folder.".into());
-                }
-            }
-        });
-        ui.add_space(8.0);
-        egui::ScrollArea::vertical()
-            .id_salt("library_results")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (i, s) in self.search_results.iter().enumerate() {
-                    Self::card(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("[{}] {}:{}", i + 1, s.path, s.line))
-                                    .strong()
-                                    .color(pl.accent),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("Copy").clicked() {
-                                        ui.ctx().copy_text(s.text.clone());
-                                    }
-                                },
-                            );
-                        });
-                        ui.label(&s.text);
-                    });
-                    ui.add_space(8.0);
-                }
-            });
     }
 
     pub(super) fn settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -1118,7 +1313,7 @@ impl Studio {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.config.direct_backend, true, "llama.cpp");
                     ui.selectable_value(&mut self.config.direct_backend, false, "Ollama")
-                        .on_hover_text("Optional. Also used for embedding rerank.");
+                        .on_hover_text("Optional. Can also serve embeddings.");
                 });
             });
             ui.horizontal_wrapped(|ui| {
@@ -1133,7 +1328,7 @@ impl Studio {
                     .color(p.muted),
                 );
                 if self.checking {
-                    ui.spinner();
+                    busy(ui);
                 }
             });
             ui.horizontal(|ui| {
@@ -1212,22 +1407,7 @@ impl Studio {
                         .text("Repeat penalty"),
                 );
             });
-            ui.horizontal(|ui| {
-                ui.label("Embedding model");
-                egui::ComboBox::from_id_salt("embedding_model")
-                    .selected_text(&self.config.embedding_model)
-                    .show_ui(ui, |ui| {
-                        for model in &self.embedding_models {
-                            ui.selectable_value(
-                                &mut self.config.embedding_model,
-                                model.clone(),
-                                model,
-                            );
-                        }
-                    })
-                    .response
-                    .on_hover_text("Used by Embedding rerank in Chat options. Requires Ollama.");
-            });
+            self.embedding_settings(ui);
         });
         ui.add_space(12.0);
         Self::card(ui, |ui| {
@@ -1243,6 +1423,15 @@ impl Studio {
                     }
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("Accent");
+                ui.color_edit_button_srgb(&mut self.config.accent);
+                if self.config.accent != config::DEFAULT_ACCENT
+                    && ui.small_button("Reset").clicked()
+                {
+                    self.config.accent = config::DEFAULT_ACCENT;
+                }
+            });
             let mut scale = ui.ctx().zoom_factor();
             if ui
                 .add(
@@ -1255,13 +1444,21 @@ impl Studio {
             {
                 ui.ctx().set_zoom_factor(scale);
             }
+            ui.checkbox(&mut self.config.compact, "Compact density")
+                .on_hover_text("Tighter spacing and smaller buttons");
             ui.checkbox(
                 &mut self.config.show_inspector,
                 "Show context panel in Chat",
             );
             ui.checkbox(&mut self.config.sidebar_collapsed, "Collapse sidebar")
                 .on_hover_text("Ctrl+B");
+            ui.checkbox(&mut self.config.tts, "Read replies aloud")
+                .on_hover_text("Uses the system voice. Each reply also has a Speak button.");
         });
+        ui.add_space(12.0);
+        self.privacy_settings(ui);
+        ui.add_space(12.0);
+        self.mcp_settings(ui);
         ui.add_space(12.0);
         self.updates_card(ui);
         ui.add_space(12.0);
@@ -1277,6 +1474,7 @@ impl Studio {
                     self.choose_workspace();
                 }
             });
+            self.workspace_env_settings(ui);
             ui.label(
                 RichText::new(data_dir().display().to_string())
                     .size(11.5)
@@ -1304,6 +1502,16 @@ impl Studio {
                     }
                 }
                 if ui
+                    .add_enabled(
+                        !self.conversation.messages.is_empty(),
+                        egui::Button::new("Export as Markdown…"),
+                    )
+                    .clicked()
+                {
+                    let id = self.conversation.id.clone();
+                    self.export_markdown(&id);
+                }
+                if ui
                     .button("Copy diagnostics")
                     .on_hover_text(
                         "Versions, paths and recent log lines, for a bug report. Nothing is sent.",
@@ -1313,8 +1521,251 @@ impl Studio {
                     ui.ctx().copy_text(diagnostics::report());
                     self.status = "Diagnostics copied".into();
                 }
+                if ui
+                    .button("Open logs")
+                    .on_hover_text("crash.log and llama-server logs")
+                    .clicked()
+                    && let Err(e) = diagnostics::open_logs_folder()
+                {
+                    self.error = Some(format!("Could not open the logs folder: {e}"));
+                }
             });
         });
+    }
+
+    /// Embedding backend for "Embedding rerank": a second llama-server, or Ollama.
+    fn embedding_settings(&mut self, ui: &mut egui::Ui) {
+        let p = pal(ui.ctx());
+        ui.horizontal(|ui| {
+            ui.label("Embeddings");
+            for (value, label) in [("llama", "llama.cpp"), ("ollama", "Ollama")] {
+                if ui
+                    .selectable_label(self.config.embedding_backend == value, label)
+                    .clicked()
+                {
+                    self.config.embedding_backend = value.into();
+                }
+            }
+        });
+        if self.config.embedding_backend == "ollama" {
+            ui.horizontal(|ui| {
+                ui.label("Embedding model");
+                egui::ComboBox::from_id_salt("embedding_model")
+                    .selected_text(&self.config.embedding_model)
+                    .show_ui(ui, |ui| {
+                        for model in &self.embedding_models {
+                            ui.selectable_value(
+                                &mut self.config.embedding_model,
+                                model.clone(),
+                                model,
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text("Used by Embedding rerank in Chat options. Requires Ollama.");
+            });
+        } else {
+            let name = self
+                .config
+                .embedding_gguf
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "No embedding model".into());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name).size(12.0).color(p.muted))
+                    .on_hover_text(self.config.embedding_gguf.display().to_string());
+                if ui
+                    .small_button("Models…")
+                    .on_hover_text("Choose, download and start the embedding model")
+                    .clicked()
+                {
+                    self.view = 5;
+                }
+            });
+        }
+    }
+
+    /// Web query review and trusted LAN endpoints.
+    fn privacy_settings(&mut self, ui: &mut egui::Ui) {
+        let p = pal(ui.ctx());
+        Self::card(ui, |ui| {
+            Self::eyebrow(ui, "NETWORK & PRIVACY");
+            ui.checkbox(&mut self.config.confirm_web_query, "Review web searches before sending")
+                .on_hover_text("With Web search on, the automatic first query is shown for approval before it goes to DuckDuckGo.");
+            let locked = self.worker.is_some() || self.llama.running();
+            ui.add_enabled_ui(!locked, |ui| {
+                ui.checkbox(&mut self.config.allow_lan, "Allow trusted computers on the network")
+                    .on_hover_text("Lets the external server URL point at another computer, for example a stronger PC running llama-server.")
+                    .on_disabled_hover_text("Stop the model and wait for the reply to finish.");
+            });
+            if self.config.allow_lan {
+                Self::banner(ui, true, |ui| {
+                    ui.label(
+                        "Prompts, files and tool results are sent to these computers. Only add machines you control; use https outside your home network.",
+                    );
+                });
+                let response = ui
+                    .add(
+                        egui::TextEdit::multiline(&mut self.trusted_draft)
+                            .hint_text("192.168.1.20\nstudio.local")
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text("Host names or IP addresses, one per line, without http://.");
+                if response.changed() {
+                    self.config.trusted_endpoints = self
+                        .trusted_draft
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
+                if self.config.trusted_endpoints.is_empty() {
+                    ui.label(
+                        RichText::new("No trusted hosts yet; only this computer is used.")
+                            .size(11.5)
+                            .color(p.muted),
+                    );
+                }
+            }
+        });
+    }
+
+    /// MCP servers: name, command, arguments, enabled, and Test (lists the tools).
+    fn mcp_settings(&mut self, ui: &mut egui::Ui) {
+        let p = pal(ui.ctx());
+        if self.mcp_args.len() != self.config.mcp_servers.len() {
+            self.mcp_args = self
+                .config
+                .mcp_servers
+                .iter()
+                .map(|s| s.args.join("\n"))
+                .collect();
+        }
+        let locked = self.worker.is_some();
+        let (mut test, mut remove) = (None, None);
+        Self::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                Self::eyebrow(ui, "MCP SERVERS");
+                ui.label(RichText::new("ⓘ").size(11.0).color(p.muted)).on_hover_text(
+                    "Tools from enabled servers are offered in Code mode as mcp__server__tool. Every call needs your approval. Servers run as your account.",
+                );
+            });
+            ui.add_enabled_ui(!locked, |ui| {
+                for (i, server) in self.config.mcp_servers.iter_mut().enumerate() {
+                    ui.push_id(("mcp", i), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut server.enabled, "")
+                                .on_hover_text("Enabled");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut server.name)
+                                    .hint_text("name")
+                                    .desired_width(100.0),
+                            )
+                            .on_hover_text("Letters, digits, - or _");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut server.command)
+                                    .hint_text("command, e.g. npx")
+                                    .desired_width((ui.available_width() - 120.0).max(80.0)),
+                            );
+                            if ui
+                                .add_enabled(!self.mcp_busy, egui::Button::new("Test"))
+                                .on_hover_text("Start the server and list its tools")
+                                .clicked()
+                            {
+                                test = Some(i);
+                            }
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        if let Some(args) = self.mcp_args.get_mut(i)
+                            && ui
+                                .add(
+                                    egui::TextEdit::multiline(args)
+                                        .hint_text("Arguments, one per line")
+                                        .desired_rows(1)
+                                        .desired_width(f32::INFINITY),
+                                )
+                                .changed()
+                        {
+                            server.args = args
+                                .lines()
+                                .map(str::trim)
+                                .filter(|a| !a.is_empty())
+                                .map(str::to_owned)
+                                .collect();
+                        }
+                        if let Some((name, result)) = &self.mcp_test
+                            && *name == server.name
+                        {
+                            ui.label(RichText::new(result).size(11.5).color(p.muted));
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+                if ui.button("Add server").clicked() {
+                    let taken: Vec<&str> = self
+                        .config
+                        .mcp_servers
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect();
+                    let name = (1..)
+                        .map(|n| format!("server{n}"))
+                        .find(|n| !taken.contains(&n.as_str()))
+                        .unwrap_or_default();
+                    self.config.mcp_servers.push(crate::core::mcp::McpServer {
+                        name,
+                        ..Default::default()
+                    });
+                    self.mcp_args.push(String::new());
+                }
+            });
+        });
+        if let Some(i) = remove {
+            self.config.mcp_servers.remove(i);
+            self.mcp_args.remove(i);
+        }
+        if let Some(i) = test {
+            self.test_mcp(i);
+        }
+    }
+
+    /// Extra environment variable names approved commands may see in this workspace.
+    fn workspace_env_settings(&mut self, ui: &mut egui::Ui) {
+        let key = self.config.workspace.display().to_string();
+        if self.env_draft.0 != self.config.workspace {
+            self.env_draft = (
+                self.config.workspace.clone(),
+                self.config
+                    .workspace_env
+                    .get(&key)
+                    .map(|v| v.join("\n"))
+                    .unwrap_or_default(),
+            );
+        }
+        egui::CollapsingHeader::new(RichText::new("Command environment").size(12.0))
+            .id_salt("workspace_env")
+            .show(ui, |ui| {
+                let response = ui
+                    .add(
+                        egui::TextEdit::multiline(&mut self.env_draft.1)
+                            .hint_text("CARGO_HOME\nJAVA_HOME")
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text("Names of extra variables approved commands in this workspace may see, besides PATH, HOME, TEMP and the toolchain variables. Values are read from your environment when a command runs and are never stored.");
+                if response.changed() {
+                    let names = parse_names(&self.env_draft.1);
+                    if names.is_empty() {
+                        self.config.workspace_env.remove(&key);
+                    } else {
+                        self.config.workspace_env.insert(key, names);
+                    }
+                }
+            });
     }
 
     fn updates_card(&mut self, ui: &mut egui::Ui) {
@@ -1333,7 +1784,7 @@ impl Studio {
                     self.check_updates(true);
                 }
                 if self.update_checking {
-                    ui.spinner();
+                    busy(ui);
                 }
                 if !self.update_status.is_empty() {
                     ui.label(RichText::new(&self.update_status).size(12.0).color(p.muted));
@@ -1372,6 +1823,7 @@ impl Studio {
         Self::eyebrow(ui, "BUILT-IN RUNTIME");
         let mut choose_model = false;
         let mut choose_server = false;
+        let mut auto_server = false;
         ui.add_enabled_ui(!locked && !running, |ui| {
             egui::Grid::new("llama_grid")
                 .num_columns(2)
@@ -1410,12 +1862,8 @@ impl Studio {
                             .truncate(),
                         );
                         choose_server = ui.small_button("Choose…").clicked();
-                        if !self.config.llama_server.as_os_str().is_empty()
-                            && ui.small_button("Auto").on_hover_text("Search automatically").clicked()
-                        {
-                            self.config.llama_server = Default::default();
-                            self.server_found = llama::find_server(&self.config);
-                        }
+                        auto_server = !self.config.llama_server.as_os_str().is_empty()
+                            && ui.small_button("Auto").on_hover_text("Search automatically").clicked();
                     });
                     ui.end_row();
 
@@ -1456,10 +1904,16 @@ impl Studio {
         if choose_server {
             self.choose_server();
         }
+        if auto_server {
+            self.config.llama_server = Default::default();
+            self.rescan_server();
+        }
         ui.horizontal_wrapped(|ui| {
             if running {
                 if ui.button("Stop model").clicked() {
                     self.llama.stop();
+                    self.live_port = None;
+                    self.metrics = None;
                     self.check();
                 }
                 ui.label(RichText::new("Running").color(p.accent));
@@ -1467,10 +1921,10 @@ impl Studio {
                     ui.label(RichText::new(info).size(12.0).color(p.muted));
                 }
             } else if self.llama_busy {
-                ui.spinner();
+                busy(ui);
                 ui.label(RichText::new("Loading model…").color(p.muted));
             } else {
-                ui.add_enabled_ui(!locked && self.config.gguf_model.is_file(), |ui| {
+                ui.add_enabled_ui(!locked && self.paths_ok[0], |ui| {
                     if Self::primary(ui, "Start model").clicked() {
                         self.start_llama();
                     }
@@ -1501,7 +1955,7 @@ impl Studio {
                         egui::TextEdit::singleline(&mut self.config.direct_url)
                             .desired_width(f32::INFINITY),
                     )
-                    .on_hover_text("Any OpenAI-compatible server on localhost.");
+                    .on_hover_text("Any OpenAI-compatible server. This computer only, unless a trusted host is allowed under Network & privacy.");
                 });
             });
     }
@@ -1514,9 +1968,15 @@ impl Studio {
             .ram_gb
             .map(|g| format!("{g} GB RAM"))
             .unwrap_or_else(|| "RAM unknown".into());
+        let best = setup::best_fit();
+        let also = if best.file == self.recommended.file {
+            String::new()
+        } else {
+            format!(" This machine ({ram}) can also run {}.", best.name)
+        };
         ui.label(
             RichText::new(format!(
-                "Recommended for this machine ({ram}): {}",
+                "Default download: {}.{also}",
                 self.recommended.name
             ))
             .size(12.0)
@@ -1566,5 +2026,63 @@ impl Studio {
         {
             self.start_setup();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn metrics_readout() {
+        let m = llama::Metrics {
+            ram_mb: 1536,
+            ctx_used: 2100,
+            ctx_total: 8192,
+            tokens_per_sec: Some(12.34),
+        };
+        assert_eq!(metrics_text(&m), "12.3 tok/s · 2.1k/8.2k ctx · 1.5 GB");
+        let idle = llama::Metrics {
+            ram_mb: 900,
+            ..Default::default()
+        };
+        assert_eq!(metrics_text(&idle), "900 MB");
+        assert_eq!(metrics_text(&llama::Metrics::default()), "");
+    }
+    #[test]
+    fn env_names_split_on_lines_commas_and_spaces() {
+        assert_eq!(
+            parse_names("CARGO_HOME, JAVA_HOME\n\n  GOPATH "),
+            vec!["CARGO_HOME", "JAVA_HOME", "GOPATH"]
+        );
+        assert!(parse_names("  \n").is_empty());
+    }
+    #[test]
+    fn height_estimate_grows_with_text() {
+        let short = estimate_height("hi", 800.0);
+        let long = estimate_height(&"word ".repeat(400), 800.0);
+        let lines = estimate_height(&"x\n".repeat(30), 800.0);
+        assert!(short > 40.0 && short < 80.0, "{short}");
+        assert!(long > short * 3.0, "{long}");
+        assert!(lines > 500.0, "{lines}");
+        assert!(estimate_height("", 100.0) > 0.0);
+    }
+    /// Estimating the off-screen part of a long chat must stay far cheaper than parsing it.
+    #[test]
+    fn perf_estimate_long_chat() {
+        let reply = "Some prose that wraps across the bubble width.\n".repeat(40)
+            + "```rust\nfn main() { println!(\"hi\"); }\n```\n";
+        let chat: Vec<String> = (0..500).map(|_| reply.clone()).collect();
+        let start = std::time::Instant::now();
+        let total: f32 = chat.iter().map(|m| estimate_height(m, 860.0)).sum();
+        let took = start.elapsed();
+        eprintln!(
+            "perf_estimate_long_chat: 500 messages ({} KB) in {took:?}",
+            chat.iter().map(String::len).sum::<usize>() / 1024
+        );
+        assert!(total > 0.0);
+        assert!(
+            took < std::time::Duration::from_millis(200),
+            "took {took:?}"
+        );
     }
 }

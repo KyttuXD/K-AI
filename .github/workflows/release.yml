@@ -1,8 +1,13 @@
 name: Release
 # Push a tag such as v0.3.0 to build every platform and publish a GitHub release.
 # verify: the tag matches Cargo.toml's version, fmt, clippy and cargo-deny. package: tests and the release build
-# (thin LTO) on each system, llama-server bundled, zipped as kyttu-ai-<tag>-<artifact>.zip. publish: only after both,
-# with SHA256SUMS.txt. The in-app updater (src/core/update.rs) depends on these asset names.
+# (thin LTO) on each system, llama-server bundled, zipped as kyttu-ai-<tag>-<artifact>.zip (macOS also as a .dmg).
+# publish: only after both, with SHA256SUMS.txt. The in-app updater (src/core/update.rs) depends on the zip names.
+# Signing is optional and runs only when its secrets exist:
+#   Windows: WINDOWS_CERT_PFX (base64 .pfx) and WINDOWS_CERT_PASSWORD; signtool signs "KYTTU - AI.exe".
+#   macOS: APPLE_CERT_P12 (base64 Developer ID Application .p12), APPLE_CERT_PASSWORD and APPLE_SIGNING_IDENTITY sign
+#   the app and the bundled llama.cpp files with the hardened runtime; with APPLE_ID, APPLE_TEAM_ID and
+#   APPLE_APP_PASSWORD (an app-specific password) notarytool notarizes the app and the .dmg, and both are stapled.
 # Release builds use their own Rust cache: run this workflow by hand from main (with the tag) to save it for later tags,
 # since caches saved by a tag's run are visible to that tag only.
 on:
@@ -45,7 +50,7 @@ jobs:
           shared-key: lint
           save-if: false
       - name: Linux native dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -71,11 +76,15 @@ jobs:
             os: macos-15
             macos_min: '11.0'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       KYTTU_PROFILE: release
       KYTTU_ARTIFACT: ${{ matrix.artifact }}
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
+      # Secrets cannot appear in step conditions; these say only whether each one is set.
+      WINDOWS_SIGN: ${{ secrets.WINDOWS_CERT_PFX != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+      APPLE_SIGN: ${{ secrets.APPLE_CERT_P12 != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+      APPLE_NOTARIZE: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,9 +99,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
       # The same profile as the package, so the tests and the app share one build of the dependencies.
-      - run: cargo test --locked --release
+      - name: Tests
+        shell: bash
+        run: |
+          start=$(date +%s)
+          cargo test --locked --release
+          echo "TEST_SECONDS=$(($(date +%s) - start))" >> "$GITHUB_ENV"
       # Shared with build.yml's main runs, which usually fetched or built it already.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -101,27 +115,120 @@ jobs:
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
+        run: ./scripts/package.ps1
+      - name: Sign Windows
+        if: runner.os == 'Windows' && env.WINDOWS_SIGN == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
-          ./scripts/package.ps1
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+          try {
+            & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:WINDOWS_CERT_PASSWORD 'dist\KYTTU - AI.exe'
+            if ($LASTEXITCODE -ne 0) { throw 'signtool sign failed' }
+            & $signtool.FullName verify /pa 'dist\KYTTU - AI.exe'
+            if ($LASTEXITCODE -ne 0) { throw 'signtool verify failed' }
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+      - name: Zip Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
           Push-Location dist
           7z a -tzip -mx=7 "../kyttu-ai-$($env:TAG)-${{ matrix.artifact }}.zip" *
           if ($LASTEXITCODE -ne 0) { throw 'zip failed' }
           Pop-Location
       - name: Package Linux / macOS
         if: runner.os != 'Windows'
-        run: |
-          bash scripts/package.sh
-          # zip -y keeps symlinks (the .app bundle, versioned .so files) intact.
-          (cd dist && zip -qry "../kyttu-ai-${TAG}-${{ matrix.artifact }}.zip" .)
+        run: bash scripts/package.sh
       - name: Check macOS minimum version
         if: runner.os == 'macOS'
         run: bash scripts/package.sh --check-minos
+      # Replaces package.sh's ad hoc signature: inside out (llama.cpp binaries and modules, then the app).
+      - name: Sign and notarize macOS app
+        if: runner.os == 'macOS' && env.APPLE_SIGN == 'true'
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/sign.keychain-db"
+          pass=$(openssl rand -hex 16)
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_CERT_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pass" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          app="dist/KYTTU - AI.app"
+          sign() { codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$1"; }
+          while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q Mach-O; then sign "$f"; fi
+          done < <(find "$app/Contents/Resources" -type f -print0)
+          sign "$app"
+          codesign --verify --strict --deep --verbose=2 "$app"
+          if [[ "$APPLE_NOTARIZE" == true ]]; then
+            ditto -c -k --keepParent "$app" "$RUNNER_TEMP/notarize.zip"
+            xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" --wait --timeout 30m
+            xcrun stapler staple "$app"
+          fi
+      - name: Zip Linux / macOS
+        if: runner.os != 'Windows'
+        # zip -y keeps symlinks (the .app bundle, versioned .so files) intact.
+        run: (cd dist && zip -qry "../kyttu-ai-${TAG}-${{ matrix.artifact }}.zip" .)
+      # The same app as the zip, with an Applications link for drag-to-install.
+      - name: Disk image (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          dmg="kyttu-ai-${TAG}-${{ matrix.artifact }}.dmg"
+          stage="$RUNNER_TEMP/dmg"
+          mkdir -p "$stage"
+          cp -a dist/. "$stage/"
+          ln -s /Applications "$stage/Applications"
+          # hdiutil sometimes reports the device busy on hosted runners; retry.
+          for try in 1 2 3; do
+            hdiutil create -volname "KYTTU - AI" -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg" && break
+            [[ $try -lt 3 ]] || exit 1
+            sleep 10
+          done
+          if [[ "$APPLE_SIGN" == true ]]; then
+            codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+            if [[ "$APPLE_NOTARIZE" == true ]]; then
+              xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+                --password "$APPLE_APP_PASSWORD" --wait --timeout 30m
+              xcrun stapler staple "$dmg"
+            fi
+          fi
+          hdiutil verify "$dmg"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.artifact }}
-          path: kyttu-ai-*.zip
+          path: |
+            kyttu-ai-*.zip
+            kyttu-ai-*.dmg
           if-no-files-found: error
           retention-days: 7
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: bash scripts/package.sh --summary
 
   publish:
     needs: [verify, package]
@@ -136,17 +243,22 @@ jobs:
           merge-multiple: true
       - name: Checksums
         run: |
-          ls -l kyttu-ai-*.zip
-          [[ $(ls kyttu-ai-*.zip | wc -l) -eq 5 ]] || { echo "::error::expected 5 packages"; exit 1; }
-          sha256sum kyttu-ai-*.zip > SHA256SUMS.txt
+          ls -l kyttu-ai-*
+          [[ $(ls kyttu-ai-*.zip | wc -l) -eq 5 ]] || { echo "::error::expected 5 zip packages"; exit 1; }
+          [[ $(ls kyttu-ai-*.dmg | wc -l) -eq 2 ]] || { echo "::error::expected 2 macOS disk images"; exit 1; }
+          sha256sum kyttu-ai-*.zip kyttu-ai-*.dmg > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ env.TAG }}
+          # Placed above the generated notes.
+          body: |
+            **Accessibility:** the interface is exposed to screen readers through AccessKit (Narrator, VoiceOver, Orca), and Settings has an interface scale and light and dark themes. Please open an issue for anything a screen reader or the keyboard cannot reach.
           generate_release_notes: true
           # A tag like v0.3.0-rc.1 is a pre-release, which the in-app updater skips.
           prerelease: ${{ contains(env.TAG, '-') }}
           fail_on_unmatched_files: true
           files: |
             kyttu-ai-*.zip
+            kyttu-ai-*.dmg
             SHA256SUMS.txt

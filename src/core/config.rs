@@ -1,7 +1,8 @@
 use crate::integrations::discord::BotProfile;
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
+    collections::{BTreeMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -9,7 +10,9 @@ use std::{
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Pre-v4 single documentation folder; kept so old files parse. See `doc_sources`.
     pub docs: PathBuf,
+    pub doc_sources: Vec<crate::knowledge::docs::DocSource>,
     pub workspace: PathBuf,
     pub model: String,
     pub embedding_model: String,
@@ -38,6 +41,7 @@ pub struct Config {
     pub use_web: bool,
     pub use_embeddings: bool,
     pub group_chat: bool,
+    /// Name of the documentation source to search; empty = all enabled sources.
     pub pack: String,
     pub active_persona: usize,
     /// "dark", "light" or "system".
@@ -64,8 +68,34 @@ pub struct Config {
     /// Missing in older files, so it defaults to 0 there (not the current version).
     #[serde(default)]
     pub settings_version: u32,
+    /// "llama" (a second llama-server with --embedding) or "ollama".
+    pub embedding_backend: String,
+    pub embedding_gguf: PathBuf,
+    /// Per-model overrides, keyed by GGUF file name.
+    pub model_presets: BTreeMap<String, crate::core::llama::ModelPreset>,
+    pub low_end: bool,
+    pub task_profiles: Vec<crate::core::terminal::TaskProfile>,
+    pub mcp_servers: Vec<crate::core::mcp::McpServer>,
+    /// Direct endpoints may leave this computer only when on and the host is trusted.
+    pub allow_lan: bool,
+    pub trusted_endpoints: Vec<String>,
+    pub accent: [u8; 3],
+    pub compact: bool,
+    /// Recent workspaces, newest first.
+    pub projects: Vec<PathBuf>,
+    pub pinned_conversations: Vec<String>,
+    pub last_view: usize,
+    /// Window [x, y, width, height] in logical points, keyed by monitor size "WxH".
+    pub monitor_windows: BTreeMap<String, [f32; 4]>,
+    /// Read replies aloud with the OS voice.
+    pub tts: bool,
+    /// Extra environment variable names approved commands may see, per workspace path.
+    pub workspace_env: BTreeMap<String, Vec<String>>,
+    pub confirm_web_query: bool,
 }
-const SETTINGS_VERSION: u32 = 3;
+const SETTINGS_VERSION: u32 = 4;
+pub const DEFAULT_ACCENT: [u8; 3] = [247, 87, 108];
+pub const MAX_PROJECTS: usize = 12;
 pub fn data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -75,9 +105,12 @@ impl Default for Config {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_default();
         Self {
-            docs: home.join("Documents/Projects/Docs"),
+            // No preset folder: every computer keeps its documentation somewhere else.
+            docs: PathBuf::new(),
+            doc_sources: vec![],
             workspace: std::env::current_dir().unwrap_or_else(|_| home.clone()),
-            model: "qwen2.5-coder:3b".into(),
+            // The alias llama.rs gives the default download (its file stem).
+            model: "Llama-3.2-1B-Instruct-Q4_K_M".into(),
             embedding_model: "nomic-embed-text:latest".into(),
             personas: vec![],
             discord_channel: String::new(),
@@ -118,6 +151,23 @@ impl Default for Config {
             discord_bots: vec![],
             active_conversation: String::new(),
             settings_version: SETTINGS_VERSION,
+            embedding_backend: "llama".into(),
+            embedding_gguf: PathBuf::new(),
+            model_presets: BTreeMap::new(),
+            low_end: false,
+            task_profiles: vec![],
+            mcp_servers: vec![],
+            allow_lan: false,
+            trusted_endpoints: vec![],
+            accent: DEFAULT_ACCENT,
+            compact: false,
+            projects: vec![],
+            pinned_conversations: vec![],
+            last_view: 0,
+            monitor_windows: BTreeMap::new(),
+            tts: false,
+            workspace_env: BTreeMap::new(),
+            confirm_web_query: true,
         }
     }
 }
@@ -153,12 +203,72 @@ impl Config {
                 ..defaults
             });
         }
+        if self.settings_version < 4 {
+            // v4: documentation sources replace the single docs folder; packs are source names.
+            if self.doc_sources.is_empty() {
+                self.doc_sources = crate::knowledge::docs::migrate_docs_dir(&self.docs);
+            }
+            self.pack.clear();
+        }
         self.settings_version = SETTINGS_VERSION;
         self
     }
-    pub fn save(&self) -> Result<()> {
-        save_json(&Self::path(), self)
+    /// Checks what the UI can get wrong before it is written to disk.
+    pub fn validate(&self) -> Result<()> {
+        super::personas::validate(&self.personas)?;
+        let mut names = HashSet::new();
+        for server in &self.mcp_servers {
+            ensure!(
+                valid_name(&server.name, 32),
+                "MCP server names must be 1–32 letters, digits, - or _"
+            );
+            ensure!(
+                names.insert(server.name.to_lowercase()),
+                "MCP server names must be unique"
+            );
+            ensure!(
+                !server.enabled || !server.command.trim().is_empty(),
+                "MCP server {} needs a command",
+                server.name
+            );
+        }
+        for host in &self.trusted_endpoints {
+            ensure!(
+                valid_host(host),
+                "Trusted endpoint \"{host}\" must be a host name or IP address, without http:// or a path"
+            );
+        }
+        for name in self.workspace_env.values().flatten() {
+            ensure!(
+                crate::core::tools::valid_env_name(name),
+                "\"{name}\" is not a valid environment variable name"
+            );
+        }
+        ensure!(
+            self.projects.len() <= MAX_PROJECTS,
+            "Too many recent projects"
+        );
+        Ok(())
     }
+    /// Puts `path` first in the recent projects, keeping at most MAX_PROJECTS.
+    pub fn remember_project(&mut self, path: &Path) {
+        self.projects.retain(|p| p != path);
+        self.projects.insert(0, path.to_path_buf());
+        self.projects.truncate(MAX_PROJECTS);
+    }
+}
+
+fn valid_name(name: &str, max: usize) -> bool {
+    (1..=max).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+fn valid_host(host: &str) -> bool {
+    (1..=253).contains(&host.len())
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
 }
 
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
@@ -167,15 +277,23 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Writes JSON through a temp file and a rename, keeping the previous file as `.bak`.
+/// Writes pretty JSON through a temp file and a rename, keeping the previous file as `.bak`.
 pub fn save_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(value)?)
+}
+/// Like [`save_json`] without indentation, for large files such as conversations.
+pub fn save_json_compact<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec(value)?)
+}
+/// Replaces `path` with `bytes` through a temp file and a rename, keeping the previous file as `.bak`.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = sibling(path, ".tmp");
     {
         let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
     }
     if path.is_file() {
@@ -241,6 +359,12 @@ mod tests {
         assert!(config.discord_bots.is_empty());
         assert!(config.auto_update && !config.setup_attempted);
         assert_eq!(config.theme, "dark");
+        // No preset documentation folder; the automatic web query is confirmed by default.
+        assert!(config.doc_sources.is_empty() && config.docs.as_os_str().is_empty());
+        assert!(config.confirm_web_query && !config.allow_lan && !config.tts);
+        assert_eq!(config.embedding_backend, "llama");
+        assert_eq!(config.accent, DEFAULT_ACCENT);
+        assert_eq!(config.settings_version, SETTINGS_VERSION);
     }
     #[test]
     fn llama_cpp_is_primary_for_new_and_old_settings() {
@@ -260,7 +384,7 @@ mod tests {
         )
         .unwrap();
         let migrated = old.migrate();
-        assert_eq!(migrated.settings_version, 3);
+        assert_eq!(migrated.settings_version, SETTINGS_VERSION);
         assert_eq!(migrated.discord_bots.len(), 1);
         let bot = &migrated.discord_bots[0];
         assert_eq!(bot.channels, vec!["123".to_string()]);
@@ -272,18 +396,93 @@ mod tests {
         assert!(current.migrate().discord_bots.is_empty());
     }
     #[test]
+    fn old_docs_folder_becomes_one_linked_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("MyDocs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let json = serde_json::json!({"settings_version":3,"docs":docs,"pack":"rust"});
+        let old: Config = serde_json::from_value(json).unwrap();
+        let migrated = old.migrate();
+        assert_eq!(migrated.settings_version, 4);
+        assert_eq!(migrated.doc_sources.len(), 1);
+        let source = &migrated.doc_sources[0];
+        assert_eq!(source.name, "MyDocs");
+        assert_eq!(
+            source.path.canonicalize().unwrap(),
+            docs.canonicalize().unwrap()
+        );
+        assert_eq!(source.mode, crate::knowledge::docs::SourceMode::Linked);
+        assert!(migrated.pack.is_empty());
+        // A missing old folder adds nothing, and v4 files are left alone.
+        let gone: Config =
+            serde_json::from_str(r#"{"settings_version":3,"docs":"/no/such/dir"}"#).unwrap();
+        assert!(gone.migrate().doc_sources.is_empty());
+        let json = serde_json::json!({"settings_version":4,"docs":docs});
+        let current: Config = serde_json::from_value(json).unwrap();
+        assert!(current.migrate().doc_sources.is_empty());
+    }
+    #[test]
+    fn validation_rejects_bad_values() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+        config.trusted_endpoints = vec!["http://192.168.1.5/".into()];
+        assert!(config.validate().is_err());
+        config.trusted_endpoints = vec!["192.168.1.5".into(), "studio.local:8080".into()];
+        assert!(config.validate().is_ok());
+        config
+            .workspace_env
+            .insert("C:/w".into(), vec!["MY TOKEN".into()]);
+        assert!(config.validate().is_err());
+        config
+            .workspace_env
+            .insert("C:/w".into(), vec!["CARGO_HOME".into()]);
+        assert!(config.validate().is_ok());
+        config.mcp_servers = vec![
+            crate::core::mcp::McpServer {
+                name: "fs".into(),
+                command: "npx".into(),
+                ..Default::default()
+            };
+            2
+        ];
+        assert!(config.validate().is_err());
+        config.mcp_servers.truncate(1);
+        assert!(config.validate().is_ok());
+        config.personas = vec![Default::default(), Default::default()];
+        assert!(config.validate().is_err());
+    }
+    #[test]
+    fn recent_projects_are_unique_and_capped() {
+        let mut config = Config::default();
+        for i in 0..20 {
+            config.remember_project(Path::new(&format!("/p{i}")));
+        }
+        config.remember_project(Path::new("/p5"));
+        assert_eq!(config.projects.len(), MAX_PROJECTS);
+        assert_eq!(config.projects[0], PathBuf::from("/p5"));
+        assert_eq!(
+            config
+                .projects
+                .iter()
+                .filter(|p| p.as_path() == Path::new("/p5"))
+                .count(),
+            1
+        );
+    }
+    #[test]
     fn new_fields_default_in_old_files() {
         let old: Config = serde_json::from_str(r#"{"model":"x"}"#).unwrap();
         assert!(old.coding && old.use_docs && !old.use_web);
         assert_eq!(old.max_steps, 12);
         assert!(old.window_size.is_none());
+        assert!(old.confirm_web_query && old.mcp_servers.is_empty());
     }
     #[test]
     fn atomic_save_keeps_backup_and_recovers_from_damage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         save_json(&path, &vec![1]).unwrap();
-        save_json(&path, &vec![2]).unwrap();
+        save_json_compact(&path, &vec![2]).unwrap();
         assert_eq!(read_json::<Vec<i32>>(&path), (Some(vec![2]), None));
         std::fs::write(&path, b"{ broken").unwrap();
         let (value, notice) = read_json::<Vec<i32>>(&path);

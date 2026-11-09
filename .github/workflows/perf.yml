@@ -1,0 +1,97 @@
+name: Perf
+# Weekly and on demand: the release build's size and time, and the perf_ micro timings, on each system. Results go to
+# the job summary and to a perf-<artifact> artifact (perf-<artifact>.tsv: artifact, name, value, unit).
+# perf_ tests: #[test] #[ignore = "perf"] fn perf_<area>_<what>() in any module, with no network, model or window,
+# each printing one line per measurement to stdout as `PERF <name> <value> <unit>` (for example
+# `PERF docs_chunk_1mb 12.4 ms`). `cargo test` skips them; run them with
+#   cargo test --release perf_ -- --include-ignored --nocapture --test-threads=1
+# Runs from main also save the release Rust caches that release.yml reads.
+on:
+  schedule:
+    - cron: '37 4 * * 3'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: short
+jobs:
+  perf:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: windows-x64
+            os: windows-2025
+          - artifact: linux-x64
+            os: ubuntu-24.04
+          - artifact: macos-x64
+            os: macos-15-intel
+            macos_min: '10.13'
+          - artifact: macos-arm64
+            os: macos-15
+            macos_min: '11.0'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      KYTTU_PROFILE: release
+      KYTTU_ARTIFACT: ${{ matrix.artifact }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-${{ matrix.artifact }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
+      - name: Release build
+        run: |
+          start=$(date +%s)
+          cargo build --locked --release
+          echo "BUILD_SECONDS=$(($(date +%s) - start))" >> "$GITHUB_ENV"
+      - name: perf_ tests
+        run: |
+          start=$(date +%s)
+          cargo test --locked --release perf_ -- --include-ignored --nocapture --test-threads=1 | tee perf.log
+          echo "TEST_SECONDS=$(($(date +%s) - start))" >> "$GITHUB_ENV"
+      - name: Record
+        run: |
+          grep -q '^PERF ' perf.log || { echo '::error::no PERF lines in perf.log'; exit 1; }
+          bin=target/release/kyttu-ai
+          [[ -f "$bin" ]] || bin="$bin.exe"
+          out="perf-$KYTTU_ARTIFACT.tsv"
+          {
+            printf 'artifact\tname\tvalue\tunit\n'
+            printf '%s\tbinary_size\t%s\tbytes\n' "$KYTTU_ARTIFACT" "$(wc -c < "$bin" | tr -d ' ')"
+            printf '%s\trelease_build\t%s\ts\n' "$KYTTU_ARTIFACT" "$BUILD_SECONDS"
+            printf '%s\tperf_tests\t%s\ts\n' "$KYTTU_ARTIFACT" "$TEST_SECONDS"
+            awk -v a="$KYTTU_ARTIFACT" '$1 == "PERF" && NF >= 4 { printf "%s\t%s\t%s\t%s\n", a, $2, $3, $4 }' perf.log
+          } > "$out"
+          {
+            echo "### $KYTTU_ARTIFACT"
+            echo
+            echo '| Measurement | Value |'
+            echo '|---|---|'
+            tail -n +2 "$out" | awk -F'\t' '{ printf "| %s | %s %s |\n", $2, $3, $4 }'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-${{ matrix.artifact }}
+          path: perf-*.tsv
+          if-no-files-found: error
+          retention-days: 90

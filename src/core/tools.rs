@@ -573,30 +573,132 @@ fn summary(status: &ExitStatus) -> String {
     }
 }
 
-pub fn command(root: &Path, program: &str, args: &[String]) -> Result<String> {
-    ensure!(!program.is_empty(), "Program is required");
-    ensure!(root.is_dir(), "Workspace folder does not exist");
-    let resolved = resolve_program(root, program)
-        .with_context(|| format!("Program not found on PATH or in the workspace: {program}"))?;
-    let mut command = Command::new(&resolved);
-    command
-        .args(args)
-        .current_dir(root)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for key in PASS_ENV {
+/// True for a plain environment variable name a workspace may allow through (item 61).
+pub fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '(' | ')'))
+}
+
+/// A command for `program` in `root` with stdin closed, no console window on Windows, and an
+/// environment of only PASS_ENV plus the allowed `extra_env` names that are set.
+pub(crate) fn scrubbed(program: &Path, root: &Path, extra_env: &[String]) -> Command {
+    let mut command = Command::new(program);
+    command.current_dir(root).env_clear().stdin(Stdio::null());
+    let mut pass = |key: &str| {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
-    }
+    };
+    PASS_ENV.iter().for_each(|k| pass(k));
+    extra_env
+        .iter()
+        .map(|k| k.trim())
+        .filter(|k| valid_env_name(k))
+        .for_each(pass);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
+    command
+}
+
+/// Lists workspace files with `/` separators, sorted. In a git repo this honours .gitignore
+/// (tracked plus untracked, not ignored, files); otherwise it walks the folder skipping build dirs.
+pub fn list_ignored_aware(root: &Path) -> Vec<String> {
+    const MAX: usize = 20_000;
+    let mut files: Vec<String> = git_files(root).unwrap_or_else(|| {
+        walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .max_depth(16)
+            .into_iter()
+            .filter_entry(|e| {
+                e.depth() == 0
+                    || !e
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| SKIP_DIRS.contains(&n))
+            })
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .take(MAX)
+            .filter_map(|e| {
+                let rel = e.path().strip_prefix(root).ok()?;
+                Some(rel.to_string_lossy().replace('\\', "/"))
+            })
+            .collect()
+    });
+    files.truncate(MAX);
+    files.sort_unstable();
+    files
+}
+
+fn git_files(root: &Path) -> Option<Vec<String>> {
+    if !super::git::is_repo(root) {
+        return None;
+    }
+    let git = resolve_program(root, "git")?;
+    let mut command = scrubbed(&git, root, &[]);
+    let out = command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", "core.fsmonitor=false", "ls-files", "-z"])
+        .args(["--cached", "--others", "--exclude-standard", "--", "."])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        // Tracked files deleted from the worktree are still listed by --cached.
+        .filter(|p| !p.is_empty() && root.join(p).is_file())
+        .map(str::to_owned)
+        .collect();
+    files.dedup();
+    Some(files)
+}
+
+/// Checkpoints a git workspace before the first approved write of a turn (item 1).
+/// Returns the checkpoint id, or None when it is not a repo.
+pub fn checkpoint_before_write(root: &Path) -> Result<Option<String>> {
+    if !super::git::is_repo(root) {
+        return Ok(None);
+    }
+    super::git::checkpoint(root, "Before agent changes").map(Some)
+}
+
+#[cfg(test)]
+pub fn command(root: &Path, program: &str, args: &[String]) -> Result<String> {
+    command_with_env(root, program, args, &[])
+}
+
+/// Runs an approved command; `extra_env` names variables passed through on top of PASS_ENV.
+/// The program and everything it starts are stopped on timeout.
+pub fn command_with_env(
+    root: &Path,
+    program: &str,
+    args: &[String],
+    extra_env: &[String],
+) -> Result<String> {
+    ensure!(!program.is_empty(), "Program is required");
+    ensure!(root.is_dir(), "Workspace folder does not exist");
+    let resolved = resolve_program(root, program)
+        .with_context(|| format!("Program not found on PATH or in the workspace: {program}"))?;
+    let mut command = scrubbed(&resolved, root, extra_env);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    super::terminal::Tree::prepare(&mut command);
     let mut child = command.spawn().context("Could not start program")?;
+    // On Windows, dropping the tree at the end of this call also ends leftover descendants.
+    let tree = super::terminal::Tree::attach(&child);
     fn drain(mut pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<Captured> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -620,11 +722,10 @@ pub fn command(root: &Path, program: &str, args: &[String]) -> Result<String> {
             break status;
         }
         if start.elapsed() > Duration::from_secs(60) {
+            tree.kill();
             let _ = child.kill();
             let _ = child.wait();
-            bail!(
-                "Command exceeded 60 seconds and was stopped. Child processes may require manual cleanup."
-            );
+            bail!("Command exceeded 60 seconds and was stopped with its child processes.");
         }
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -805,6 +906,52 @@ mod tests {
         for p in ["cargo", "git", "rustc.exe", "npm"] {
             assert!(!is_interpreter(p), "{p}");
         }
+    }
+    #[test]
+    fn checks_env_names() {
+        for ok in ["MY_TOKEN", "ProgramFiles(x86)", "a1"] {
+            assert!(valid_env_name(ok), "{ok}");
+        }
+        for bad in ["", "A=B", "1X", "A B", "X\0"] {
+            assert!(!valid_env_name(bad), "{bad}");
+        }
+    }
+    #[test]
+    fn scrubbed_env_passes_only_allowed_names() {
+        let extra = std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .find(|k| valid_env_name(k) && !PASS_ENV.iter().any(|p| p.eq_ignore_ascii_case(k)));
+        let Some(extra) = extra else { return };
+        let has = |allowed: &[String]| {
+            scrubbed(Path::new("x"), Path::new("."), allowed)
+                .get_envs()
+                .any(|(k, v)| k == extra.as_str() && v.is_some())
+        };
+        assert!(!has(&[]));
+        assert!(has(std::slice::from_ref(&extra)));
+    }
+    #[test]
+    fn lists_files_honouring_gitignore() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::create_dir_all(root.join("target"))?;
+        std::fs::write(root.join("src").join("main.rs"), "")?;
+        std::fs::write(root.join("target").join("out.o"), "")?;
+        std::fs::write(root.join("notes.log"), "")?;
+        std::fs::write(root.join(".gitignore"), "*.log\n")?;
+        let walked = list_ignored_aware(root);
+        assert!(walked.contains(&"src/main.rs".into()) && !walked.contains(&"target/out.o".into()));
+        assert!(walked.contains(&"notes.log".into()));
+        let git = resolve_program(root, "git");
+        let init = git.map(|g| scrubbed(&g, root, &[]).args(["init", "-q"]).status());
+        if !init.is_some_and(|s| s.is_ok_and(|s| s.success())) {
+            return Ok(());
+        }
+        let listed = list_ignored_aware(root);
+        assert!(listed.contains(&"src/main.rs".into()) && listed.contains(&".gitignore".into()));
+        assert!(!listed.contains(&"notes.log".into()));
+        Ok(())
     }
     #[test]
     fn resolves_programs() -> Result<()> {

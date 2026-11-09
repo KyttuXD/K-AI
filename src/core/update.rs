@@ -17,7 +17,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -185,12 +185,19 @@ fn parse_release(v: &Value, current: &str, artifact: &str) -> Result<Option<Rele
     }))
 }
 
+/// Shared clients: one with a request timeout (API, checksums), one without
+/// (the release download).
 fn client(timeout: Option<Duration>) -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
-        .user_agent("kyttu-ai")
-        .connect_timeout(TIMEOUT)
-        .timeout(timeout)
-        .build()?)
+    static TIMED: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    static UNTIMED: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    let cell = if timeout.is_some() { &TIMED } else { &UNTIMED };
+    super::llama::shared(cell, || {
+        reqwest::blocking::Client::builder()
+            .user_agent("kyttu-ai")
+            .connect_timeout(TIMEOUT)
+            .timeout(timeout)
+            .build()
+    })
 }
 
 /// The latest stable release when it is newer than this build.

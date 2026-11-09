@@ -1,11 +1,22 @@
 use crate::docs::Source;
 use anyhow::{Context, Result, ensure};
 use scraper::{Html, Selector};
-use std::{io::Read, time::Duration};
+use std::{io::Read, sync::LazyLock, time::Duration};
 
 /// Generic User-Agent: no app name or version that would identify this install.
-pub const USER_AGENT: &str = "Mozilla/5.0 (compatible; kyttu-ai)";
+pub const USER_AGENT: &str = "Mozilla/5.0";
 const QUERY_CHARS: usize = 120;
+
+/// One client for every search, so connections and the TLS setup are reused. A short connect
+/// timeout makes a bad network or captive portal fail fast instead of holding up the reply.
+static CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(20))
+        .user_agent(USER_AGENT)
+        .build()
+        .expect("web search HTTP client")
+});
 
 /// A short search query from a chat question: code blocks dropped, whitespace
 /// collapsed, cut at a word boundary. Callers should still show it for review.
@@ -36,11 +47,7 @@ pub fn search(query: &str) -> Result<Vec<Source>> {
         !query.trim().is_empty() && query.len() <= 1000,
         "Search query must be 1–1000 bytes"
     );
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent(USER_AGENT)
-        .build()?;
-    let response = client
+    let response = CLIENT
         .get("https://html.duckduckgo.com/html/")
         .query(&[("q", query)])
         .send()?
@@ -127,6 +134,29 @@ mod tests {
         );
         let long = query_from(&"word ".repeat(100));
         assert!(long.len() <= QUERY_CHARS && long.ends_with("word"));
-        assert!(!USER_AGENT.to_lowercase().contains("0.2"));
+        assert_eq!(USER_AGENT, "Mozilla/5.0");
+    }
+    #[test]
+    fn perf_parse_search_results() {
+        // A results page about the size DuckDuckGo returns, most of it markup to skip.
+        let mut page = String::from("<html><body>");
+        for i in 0..30 {
+            page.push_str(&format!(
+                r#"<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F{i}">Title {i}</a><a class="result__snippet">{}</a></div>"#,
+                "snippet text ".repeat(40)
+            ));
+            page.push_str(&"<div><span>filler</span></div>".repeat(40));
+        }
+        page.push_str("</body></html>");
+        let start = std::time::Instant::now();
+        let sources = parse_results(&page).unwrap();
+        let elapsed = start.elapsed();
+        eprintln!(
+            "perf_parse_search_results: {} KB page in {:.2} ms",
+            page.len() / 1024,
+            elapsed.as_secs_f64() * 1000.0
+        );
+        assert_eq!(sources.len(), 4);
+        assert!(elapsed < Duration::from_secs(2), "parsing took {elapsed:?}");
     }
 }

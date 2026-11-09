@@ -1,9 +1,14 @@
 pub mod config;
 pub mod diagnostics;
 pub mod engine;
+pub mod git;
+pub mod hub;
 pub mod llama;
+pub mod mcp;
 pub mod personas;
 pub mod provider;
+pub mod secrets;
 pub mod setup;
+pub mod terminal;
 pub mod tools;
 pub mod update;
