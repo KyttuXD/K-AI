@@ -567,11 +567,35 @@ fn text_tool_calls(content: &str, definitions: &Value) -> (String, Vec<Value>) {
         .filter_map(|d| d["function"]["name"].as_str())
         .collect();
     let found = json_calls(content, Some(&known));
-    if found.is_empty() {
-        (content.to_owned(), found)
-    } else {
-        (String::new(), found)
+    if !found.is_empty() {
+        return (String::new(), found);
     }
+    // Prose around a fenced block that holds a call ("Let's list the files: ```json {...}```").
+    // Only the first such block runs, and the text after it is dropped: small models go on to
+    // invent the tool's output, which must not be taken as real.
+    if let Some((start, calls)) = fenced_call(content, &known) {
+        return (content[..start].trim().to_owned(), calls);
+    }
+    (content.to_owned(), found)
+}
+
+/// The first Markdown code block whose whole body is a call to an offered tool: where the block
+/// starts in `content`, and the calls it holds.
+fn fenced_call(content: &str, known: &[&str]) -> Option<(usize, Vec<Value>)> {
+    let mut from = 0;
+    while let Some(open) = content[from..].find("```") {
+        let start = from + open;
+        let after = &content[start + 3..];
+        let body_start = after.find('\n').map_or(0, |n| n + 1);
+        let end = after[body_start..].find("```")?;
+        let body = &after[body_start..body_start + end];
+        let calls = json_calls(body, Some(known));
+        if !calls.is_empty() {
+            return Some((start, calls));
+        }
+        from = start + 3 + body_start + end + 3;
+    }
+    None
 }
 
 fn json_calls(text: &str, known: Option<&[&str]>) -> Vec<Value> {
@@ -727,6 +751,31 @@ mod tests {
         assert_eq!(rest, answer);
         let web = r#"{"name":"web_search","arguments":{"query":"x"}}"#;
         assert!(text_tool_calls(web, &defs).1.is_empty());
+    }
+    #[test]
+    fn recovers_a_fenced_call_inside_prose() {
+        let defs = tools::definitions(&tools::ToolSet {
+            docs: false,
+            web: false,
+        });
+        // A small model's reply: prose, a fenced call, then an invented result and a second call.
+        let reply = "Let's start by listing all the files in the workspace:\n\n```json\n{\"name\": \"list_files\", \"arguments\": {}}\n```\n\nOnce we have the list, let's assume main.rs changed.\n\nNext:\n\n```json\n{\"name\": \"search_code\", \"arguments\": {\"query\": \"TODO\", \"case_sensitive\": false}}\n```\nThis will help.";
+        let (rest, calls) = text_tool_calls(reply, &defs);
+        // Only the first call runs; the invented follow-up is dropped.
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "list_files");
+        assert_eq!(
+            rest,
+            "Let's start by listing all the files in the workspace:"
+        );
+        // A code block that is not a call stays part of an ordinary answer.
+        let answer = "Use this:\n```json\n{\"name\": \"Alice\"}\n```\nDone.";
+        let (rest, calls) = text_tool_calls(answer, &defs);
+        assert!(calls.is_empty());
+        assert_eq!(rest, answer);
+        // A call to a tool that is not offered is ignored too.
+        let other = "Try:\n```json\n{\"name\": \"delete_everything\", \"arguments\": {}}\n```";
+        assert!(text_tool_calls(other, &defs).1.is_empty());
     }
     #[test]
     fn formats_speed_from_timings() {
