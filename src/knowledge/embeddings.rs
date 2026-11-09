@@ -94,48 +94,68 @@ fn cache_model(config: &Config) -> String {
     format!("gguf:{}", gguf_name(config))
 }
 
-/// How a model wants its inputs marked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Prompting {
-    /// nomic-embed-text: "search_query: " and "search_document: " (also the
-    /// fallback for unknown models, as before).
-    Nomic,
-    /// Qwen3-Embedding: an instruction on the query only, passages as they are.
-    Qwen3,
+/// The text put before the query and before each passage for a model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Marks {
+    query: Option<String>,
+    passage: Option<String>,
 }
 
-const QWEN3_QUERY: &str = "Instruct: Given a search query, retrieve relevant passages\nQuery: ";
+impl Marks {
+    fn query(&self, query: &str) -> String {
+        with_mark(self.query.as_deref(), query)
+    }
 
-/// The prompting of a model, from its GGUF file name or Ollama tag.
-fn prompting_for(model: &str) -> Prompting {
-    if model.to_lowercase().contains("qwen3-embedding") {
-        Prompting::Qwen3
-    } else {
-        Prompting::Nomic
+    fn passage(&self, text: &str) -> String {
+        with_mark(self.passage.as_deref(), text)
     }
 }
 
-fn prompting(config: &Config) -> Prompting {
+fn with_mark(mark: Option<&str>, text: &str) -> String {
+    format!("{}{text}", mark.unwrap_or(""))
+}
+
+/// The marks of an Ollama model, from its tag: Qwen3-Embedding's (instruction on the
+/// query only) when the tag names it, nomic-embed's when it names nomic-embed, and
+/// none otherwise, as for a custom GGUF file.
+fn ollama_marks(tag: &str) -> Marks {
+    let tag = tag.to_lowercase();
+    if tag.contains("qwen3-embedding") {
+        Marks {
+            query: Some(setup::QWEN3_QUERY.into()),
+            passage: None,
+        }
+    } else if tag.contains("nomic-embed") {
+        Marks {
+            query: Some(setup::NOMIC_QUERY.into()),
+            passage: Some(setup::NOMIC_DOCUMENT.into()),
+        }
+    } else {
+        Marks::default()
+    }
+}
+
+/// The GGUF the llama.cpp backend embeds with: the installed one, else the
+/// configured or default file (only its name and marks matter before a download).
+fn gguf_path(config: &Config) -> PathBuf {
+    llama::embed_model_path(config).unwrap_or_else(|| {
+        if config.embedding_gguf.as_os_str().is_empty() {
+            setup::embed_path(&setup::EMBED_MODELS[0])
+        } else {
+            config.embedding_gguf.clone()
+        }
+    })
+}
+
+/// The marks of the configured model: its GGUF profile, or its Ollama tag.
+fn marks_for(config: &Config) -> Marks {
     if uses_ollama(config) {
-        prompting_for(&config.embedding_model)
-    } else {
-        prompting_for(&gguf_name(config))
+        return ollama_marks(&config.embedding_model);
     }
-}
-
-impl Prompting {
-    fn query(self, query: &str) -> String {
-        match self {
-            Self::Nomic => format!("search_query: {query}"),
-            Self::Qwen3 => format!("{QWEN3_QUERY}{query}"),
-        }
-    }
-
-    fn passage(self, text: &str) -> String {
-        match self {
-            Self::Nomic => format!("search_document: {text}"),
-            Self::Qwen3 => text.to_string(),
-        }
+    let profile = setup::embed_profile(&gguf_path(config));
+    Marks {
+        query: profile.query_prefix,
+        passage: profile.passage_prefix,
     }
 }
 
@@ -162,12 +182,9 @@ fn embed_llama(config: &Config, text: &[String]) -> Result<Vec<Vec<f32>>, EmbedE
         return Err(EmbedError::ModelMissing(wanted));
     }
     let runtime = llama::embed_runtime();
-    let port = match runtime.port() {
-        Some(port) => port,
-        None => runtime
-            .start(config)
-            .map_err(|e| EmbedError::Unavailable(format!("{e:#}")))?,
-    };
+    let port = runtime
+        .start(config)
+        .map_err(|e| EmbedError::Unavailable(format!("{e:#}")))?;
     let input: Vec<String> = text
         .iter()
         .map(|t| t.chars().take(MAX_INPUT_CHARS).collect())
@@ -520,13 +537,13 @@ pub fn rerank(
             })
             .collect())
     })?;
-    let style = prompting(config);
-    let document = |i: usize| style.passage(&candidates[i].text);
+    let marks = marks_for(config);
+    let document = |i: usize| marks.passage(&candidates[i].text);
     // The query and the passages missing from the cache go in one embedding request.
     let mut missing: Vec<usize> = (0..vectors.len())
         .filter(|&i| vectors[i].is_none())
         .collect();
-    let mut inputs = vec![style.query(query)];
+    let mut inputs = vec![marks.query(query)];
     inputs.extend(missing.iter().map(|&i| document(i)));
     let mut fresh = embed(config, &inputs)?;
     let query_vector = fresh.remove(0);
@@ -710,23 +727,39 @@ mod tests {
     }
     #[test]
     fn qwen3_marks_only_the_query() {
-        let qwen = prompting_for("Qwen3-Embedding-4B-Q4_K_M.gguf");
-        assert_eq!(qwen, Prompting::Qwen3);
-        assert_eq!(prompting_for("qwen3-embedding:4b"), Prompting::Qwen3);
+        let qwen = ollama_marks("qwen3-embedding:4b");
         assert_eq!(
             qwen.query("how to x"),
             "Instruct: Given a search query, retrieve relevant passages\nQuery: how to x"
         );
         assert_eq!(qwen.passage("text"), "text");
-        let nomic = prompting_for("nomic-embed-text-v1.5.Q8_0.gguf");
+        let nomic = ollama_marks("nomic-embed-text");
         assert_eq!(nomic.query("q"), "search_query: q");
         assert_eq!(nomic.passage("p"), "search_document: p");
+        assert_eq!(ollama_marks("bge-m3"), Marks::default());
         let ollama_qwen = Config {
             embedding_backend: "Ollama".into(),
-            embedding_model: "qwen3-embedding:4b".into(),
+            embedding_model: "Qwen3-Embedding:4b".into(),
             ..Default::default()
         };
-        assert_eq!(prompting(&ollama_qwen), Prompting::Qwen3);
+        assert_eq!(marks_for(&ollama_qwen).passage, None);
+    }
+    #[test]
+    fn gguf_marks_follow_the_file_profile() {
+        let known = Config {
+            embedding_gguf: PathBuf::from("/nope/Qwen3-Embedding-4B-Q4_K_M.gguf"),
+            ..Default::default()
+        };
+        let marks = marks_for(&known);
+        assert_eq!(marks.query("q"), format!("{}q", setup::QWEN3_QUERY));
+        assert_eq!(marks.passage("p"), "p");
+        // A custom file gets no marks, whatever its name suggests.
+        let custom = Config {
+            embedding_gguf: PathBuf::from("/nope/custom-nomic.gguf"),
+            ..Default::default()
+        };
+        assert_eq!(marks_for(&custom), Marks::default());
+        assert_eq!(marks_for(&custom).query("q"), "q");
     }
     #[test]
     fn reads_ollama_pull_stream() {

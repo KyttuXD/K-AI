@@ -1544,39 +1544,40 @@ pub fn embed_model_path(config: &Config) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// How the embedding server runs a model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EmbedProfile {
-    /// `--pooling`, for known models only (others use the GGUF's own).
-    pooling: Option<&'static str>,
+/// How the embedding server runs a model: its pooling (from setup::embed_profile)
+/// and its context and batch sizes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EmbedRun {
+    /// `--pooling` value (mean, cls, last or rank).
+    pooling: String,
     ctx: usize,
     /// -b and -ub: one input must fit in a single micro-batch.
     batch: usize,
 }
 
-/// Known models by file name get their pooling; Qwen3-Embedding (32k
-/// context, last-token pooling) gets a 4096-token batch on 16 GB or more,
-/// else 2048 (no input is longer than about 2k tokens). Everything else keeps
-/// 8192 context and 2048 batch. The context is four slots (`--parallel 4`)
-/// of one full batch each, so every slot holds the longest input.
-fn embed_profile(model: &Path, ram_gb: Option<u64>) -> EmbedProfile {
+/// The pooling comes from setup::embed_profile for the file. Qwen3-Embedding
+/// (32k context) gets a 4096-token batch on 16 GB or more, else 2048 (no input
+/// is longer than about 2k tokens). Everything else keeps 8192 context and 2048
+/// batch. The context is four slots (`--parallel 4`) of one full batch each, so
+/// every slot holds the longest input.
+fn embed_run(model: &Path, ram_gb: Option<u64>) -> EmbedRun {
     let name = model
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let pooling = setup::embed_choice(&name).map(|c| c.pooling);
+    let pooling = setup::embed_profile(model).pooling;
     if name.to_lowercase().contains("qwen3-embedding") {
         let batch = match ram_gb.unwrap_or(0) {
             r if r >= 16 => 4096,
             _ => 2048,
         };
-        return EmbedProfile {
-            pooling: pooling.or(Some("last")),
+        return EmbedRun {
+            pooling,
             ctx: batch * 4,
             batch,
         };
     }
-    EmbedProfile {
+    EmbedRun {
         pooling,
         ctx: 8192,
         batch: 2048,
@@ -1590,7 +1591,7 @@ fn embed_args(
     port: u16,
     threads: usize,
     build: Option<u32>,
-    profile: EmbedProfile,
+    run: &EmbedRun,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-m".into(),
@@ -1601,10 +1602,8 @@ fn embed_args(
         port.to_string(),
     ];
     args.extend(["--alias", EMBED_ALIAS, "--embedding"].map(String::from));
-    if let Some(pooling) = profile.pooling {
-        args.extend(["--pooling".into(), pooling.into()]);
-    }
-    let (ctx, batch) = (profile.ctx.to_string(), profile.batch.to_string());
+    args.extend(["--pooling".into(), run.pooling.clone()]);
+    let (ctx, batch) = (run.ctx.to_string(), run.batch.to_string());
     args.extend(
         [
             "-c",
@@ -1686,8 +1685,8 @@ impl EmbedRuntime {
         let port = free_port(config.llama_port.saturating_add(100))
             .context("No free port for the embedding server")?;
         let build = server_version(&server).as_deref().and_then(build_number);
-        let profile = embed_profile(&model, setup::total_ram_gb());
-        let args = embed_args(&model, port, config.llama_threads, build, profile);
+        let run = embed_run(&model, setup::total_ram_gb());
+        let args = embed_args(&model, port, config.llama_threads, build, &run);
         self.proc
             .spawn(&server, &args, File::create(&log_path)?, &embed_pid_path())?;
         if let Err(e) = wait_ready(port, EMBED_ALIAS, &log_path, &|| self.running()) {
@@ -1962,16 +1961,17 @@ mod tests {
     }
     #[test]
     fn embedding_server_args() {
+        // A file name that no known model uses, with no GGUF metadata: mean pooling.
         let model = Path::new("/m/nomic.gguf");
-        let profile = embed_profile(model, Some(16));
-        let args = embed_args(model, 8180, 4, None, profile).join(" ");
+        let run = embed_run(model, Some(16));
+        let args = embed_args(model, 8180, 4, None, &run).join(" ");
         assert!(args.contains("--embedding") && args.contains("--port 8180"));
         assert!(args.contains(&format!("--alias {EMBED_ALIAS}")));
         assert!(args.contains("-c 8192 --parallel 4 -b 2048 -ub 2048"));
         assert!(args.contains("-ngl 0 --device none -t 4"));
-        assert!(!args.contains("--pooling"));
+        assert!(args.contains("--pooling mean"));
         assert!(
-            !embed_args(Path::new("a"), 1, 0, Some(3000), profile)
+            !embed_args(Path::new("a"), 1, 0, Some(3000), &run)
                 .join(" ")
                 .contains("--device")
         );
@@ -1979,27 +1979,52 @@ mod tests {
     #[test]
     fn known_embedding_models_get_pooling_and_batches() {
         let nomic = Path::new("/m").join(setup::EMBED_MODEL.file);
-        let p = embed_profile(&nomic, Some(4));
-        assert_eq!((p.pooling, p.ctx, p.batch), (Some("mean"), 8192, 2048));
+        let p = embed_run(&nomic, Some(4));
+        assert_eq!((p.pooling.as_str(), p.ctx, p.batch), ("mean", 8192, 2048));
         let qwen = Path::new("/m/Qwen3-Embedding-4B-Q4_K_M.gguf");
-        let big = embed_profile(qwen, Some(32));
+        let big = embed_run(qwen, Some(32));
         assert_eq!(
-            (big.pooling, big.ctx, big.batch),
-            (Some("last"), 16384, 4096)
+            (big.pooling.as_str(), big.ctx, big.batch),
+            ("last", 16384, 4096)
         );
-        let mid = embed_profile(qwen, Some(8));
+        let mid = embed_run(qwen, Some(8));
         assert_eq!((mid.ctx, mid.batch), (8192, 2048));
-        let small = embed_profile(qwen, None);
+        let small = embed_run(qwen, None);
         assert_eq!((small.ctx, small.batch), (8192, 2048));
         // Each of the four slots holds one full batch.
-        for p in [big, mid, small] {
+        for p in [&big, &mid, &small] {
             assert_eq!(p.ctx, p.batch * 4);
         }
         // Another Qwen3-Embedding quant still pools on the last token.
-        let other = embed_profile(Path::new("Qwen3-Embedding-0.6B-f16.gguf"), Some(16));
-        assert_eq!(other.pooling, Some("last"));
-        let args = embed_args(qwen, 1, 0, None, big).join(" ");
+        let other = embed_run(Path::new("Qwen3-Embedding-0.6B-f16.gguf"), Some(16));
+        assert_eq!(other.pooling, "last");
+        let args = embed_args(qwen, 1, 0, None, &big).join(" ");
         assert!(args.contains("--pooling last -c 16384 --parallel 4 -b 4096 -ub 4096"));
+    }
+    #[test]
+    fn embedding_server_pools_by_the_file_it_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        // A custom GGUF whose metadata says CLS pooling keeps it.
+        let mut bge = b"GGUF".to_vec();
+        bge.extend(3u32.to_le_bytes());
+        bge.extend(0u64.to_le_bytes());
+        bge.extend(2u64.to_le_bytes());
+        for (key, kind, value) in [
+            ("general.architecture", 8u32, b"bert".to_vec()),
+            ("bert.pooling_type", 4u32, 2u32.to_le_bytes().to_vec()),
+        ] {
+            bge.extend((key.len() as u64).to_le_bytes());
+            bge.extend(key.as_bytes());
+            bge.extend(kind.to_le_bytes());
+            if kind == 8 {
+                bge.extend((value.len() as u64).to_le_bytes());
+            }
+            bge.extend(value);
+        }
+        let path = dir.path().join("bge-custom.gguf");
+        fs::write(&path, bge).unwrap();
+        let args = embed_args(&path, 1, 0, None, &embed_run(&path, Some(8))).join(" ");
+        assert!(args.contains("--pooling cls"));
     }
     #[test]
     fn finds_the_matching_vision_projector() {

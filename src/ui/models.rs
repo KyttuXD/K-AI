@@ -3,7 +3,7 @@
 //! the embedding models and server and a live performance readout. Network
 //! and disk work runs on worker threads.
 use super::*;
-use crate::core::{hub, llama::ModelPreset};
+use crate::core::{gguf, hub, llama::ModelPreset};
 use crate::knowledge::embeddings;
 use std::{
     collections::{HashMap, HashSet},
@@ -92,6 +92,8 @@ enum Action {
     EmbedStart,
     EmbedStop,
     AddFile,
+    /// Marks (true) or unmarks (false) a file as an embedding model.
+    SetEmbedding(PathBuf, bool),
 }
 
 #[derive(Default)]
@@ -118,11 +120,82 @@ pub struct ModelsState {
     embed_have: bool,
     /// Per setup::EMBED_MODELS entry: downloaded into the models folder.
     embed_installed: Vec<bool>,
+    /// GGUF path → (file size, is an embedding model), read once per size.
+    gguf_cache: HashMap<PathBuf, (u64, bool)>,
+    /// Installed files that are embedding models (the user's choice, else the metadata).
+    embed_paths: HashSet<PathBuf>,
+    /// Custom embedding files from config.embed_models that are installed, with sizes.
+    custom_embed: Vec<(PathBuf, u64)>,
+    /// Ollama embedding model name typed in the Embeddings card.
+    ollama_name: String,
     /// Model file name → the projector llama::find_mmproj picks next to it.
     auto_mmproj: HashMap<String, PathBuf>,
     /// Model file names with a projector (chosen in the preset or found).
     vision: HashSet<String>,
     note: String,
+}
+
+impl ModelsState {
+    /// Sorts the installed files into chat and embedding models and lists the custom
+    /// embedding files. Each file's header is read once per size, kept across refreshes.
+    fn scan(&mut self, config: &crate::core::config::Config) {
+        let mut paths: Vec<PathBuf> = self
+            .installed
+            .iter()
+            .map(|(path, _)| path.clone())
+            .filter(|path| !is_mmproj(&file_name(path)))
+            .collect();
+        if self.active_size.is_some() {
+            paths.push(config.gguf_model.clone());
+        }
+        paths.sort();
+        paths.dedup();
+        let mut cache = std::mem::take(&mut self.gguf_cache);
+        let mut embedding = HashSet::new();
+        for path in &paths {
+            let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let by_metadata = match cache.get(path) {
+                Some(&(cached, known)) if cached == size => known,
+                _ => {
+                    let known = gguf::read_info(path).is_some_and(|info| info.is_embedding);
+                    cache.insert(path.clone(), (size, known));
+                    known
+                }
+            };
+            let hidden = config.chat_hidden.contains(path);
+            if config.embed_models.contains(path)
+                || (!hidden && (by_metadata || is_embed_file(&file_name(path))))
+            {
+                embedding.insert(path.clone());
+            }
+        }
+        cache.retain(|path, _| paths.contains(path));
+        self.gguf_cache = cache;
+        self.embed_paths = embedding;
+        let defaults: Vec<PathBuf> = setup::EMBED_MODELS.iter().map(setup::embed_path).collect();
+        // The user's custom files, plus detected files that have no known name.
+        let mut listed: Vec<PathBuf> = config
+            .embed_models
+            .iter()
+            .filter(|path| !defaults.contains(path))
+            .cloned()
+            .collect();
+        listed.extend(
+            self.embed_paths
+                .iter()
+                .filter(|path| **path != config.gguf_model && !is_embed_file(&file_name(path)))
+                .cloned(),
+        );
+        listed.sort();
+        listed.dedup();
+        self.custom_embed = listed
+            .into_iter()
+            .filter_map(|path| {
+                let meta = fs::metadata(&path).ok().filter(|m| m.is_file())?;
+                Some((path, meta.len()))
+            })
+            .collect();
+    }
 }
 
 fn file_name(path: &Path) -> String {
@@ -390,6 +463,8 @@ impl Studio {
                 .sort_by_key(|(p, _)| p.file_name().map(|n| n.to_ascii_lowercase()));
             s.installed_at = Some(Instant::now());
             // File checks happen here, not per frame: these paths may be on slow drives.
+            // scan() also reads a header (up to 16 MB) for each new or resized model on this
+            // thread: a one-time cost per file, kept out of the cached per-size checks.
             s.active_size = fs::metadata(&self.config.gguf_model)
                 .ok()
                 .filter(|m| m.is_file())
@@ -410,6 +485,7 @@ impl Studio {
                 self.config.embedding_gguf = setup::embed_path(m);
             }
             s.embed_have = self.config.embedding_gguf.is_file();
+            s.scan(&self.config);
             s.auto_mmproj.clear();
             s.vision.clear();
             let models = s
@@ -419,7 +495,11 @@ impl Studio {
                 .chain(s.active_size.map(|_| self.config.gguf_model.clone()));
             for path in models {
                 let name = file_name(&path);
-                if is_mmproj(&name) || is_embed_file(&name) || s.vision.contains(&name) {
+                if is_mmproj(&name)
+                    || is_embed_file(&name)
+                    || s.embed_paths.contains(&path)
+                    || s.vision.contains(&name)
+                {
                     continue;
                 }
                 let chosen = self
@@ -501,6 +581,11 @@ impl Studio {
                 }
             }
         }
+        // A deleted file leaves no stale embedding or chat-hidden entry behind.
+        let was_custom = self.config.embed_models.contains(&path);
+        let was_hidden = self.config.chat_hidden.contains(&path);
+        self.config.embed_models.retain(|p| *p != path);
+        self.config.chat_hidden.retain(|p| *p != path);
         let name = file_name(&path);
         let old_preset = self.config.model_presets.remove(&name);
         // A deleted projector falls back to the automatic pick.
@@ -544,6 +629,12 @@ impl Studio {
                 for key in cleared {
                     studio.config.model_presets.entry(key).or_default().mmproj =
                         Some(undo_path.clone());
+                }
+                if was_custom {
+                    studio.config.embed_models.push(undo_path.clone());
+                }
+                if was_hidden {
+                    studio.config.chat_hidden.push(undo_path.clone());
                 }
                 if was_model {
                     studio.config.gguf_model = undo_path.clone();
@@ -663,6 +754,18 @@ impl Studio {
             }
             Action::EmbedStop => self.embed_runtime.stop(),
             Action::AddFile => self.choose_model_file(),
+            Action::SetEmbedding(path, on) => {
+                s.installed_at = None;
+                let c = &mut self.config;
+                c.embed_models.retain(|p| *p != path);
+                c.chat_hidden.retain(|p| *p != path);
+                if on {
+                    c.embed_models.push(path);
+                } else {
+                    c.chat_hidden.push(path);
+                }
+                self.persist();
+            }
         }
     }
 
@@ -766,6 +869,9 @@ impl Studio {
         {
             rows.insert(0, (active.clone(), size));
         }
+        // Embedding models are listed under Embeddings; the loaded chat model always stays.
+        let embed_paths = &self.models_state.embed_paths;
+        rows.retain(|(path, _)| *path == active || !embed_paths.contains(path));
         let active_name = file_name(&active);
         let active_projector = self
             .config
@@ -774,7 +880,6 @@ impl Studio {
             .and_then(|p| p.mmproj.clone())
             .or_else(|| self.models_state.auto_mmproj.get(&active_name).cloned());
         let s = &mut self.models_state;
-        let embed = &self.config.embedding_gguf;
         Self::card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -794,7 +899,6 @@ impl Studio {
                     for (path, size) in &rows {
                         let name = file_name(path);
                         let is_active = *path == active;
-                        let is_embed = path == embed || is_embed_file(&name);
                         let is_projector = is_mmproj(&name);
                         let text = if is_active {
                             RichText::new(format!("● {}", short(&name, 52)))
@@ -806,6 +910,16 @@ impl Studio {
                         ui.label(text).on_hover_text(path.display().to_string());
                         ui.label(RichText::new(format_size(*size)).color(p.muted));
                         ui.horizontal(|ui| {
+                            if !is_projector {
+                                let mut on = s.embed_paths.contains(path);
+                                if ui
+                                    .checkbox(&mut on, RichText::new("Embedding model").size(12.0))
+                                    .on_hover_text("Use this file for document search, not chat")
+                                    .changed()
+                                {
+                                    actions.push(Action::SetEmbedding(path.clone(), on));
+                                }
+                            }
                             if s.vision.contains(&name) {
                                 ui.label(RichText::new("Vision").size(12.0).color(p.ok))
                                     .on_hover_text(
@@ -817,8 +931,6 @@ impl Studio {
                                     .on_hover_text(
                                         "Vision projector: loaded with its model, not on its own",
                                     );
-                            } else if is_embed {
-                                ui.label(RichText::new("Embedding").size(12.0).color(p.muted));
                             } else if is_active && running {
                                 ui.label(RichText::new("In use").size(12.0).color(p.accent));
                             } else if ui
@@ -856,8 +968,10 @@ impl Studio {
             .models_state
             .installed
             .iter()
+            .filter(|(path, _)| {
+                !is_mmproj(&file_name(path)) && !self.models_state.embed_paths.contains(path)
+            })
             .map(|(path, _)| file_name(path))
-            .filter(|n| !is_embed_file(n) && !is_mmproj(n))
             .chain((!active.is_empty()).then(|| active.clone()))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -1236,6 +1350,7 @@ impl Studio {
         let starting = self.models_state.embed_start.is_some();
         let downloading = self.models_state.download.is_some();
         let ollama_models = &self.embedding_models;
+        let models_dir = setup::models_dir();
         let s = &mut self.models_state;
         let c = &mut self.config;
         let mut changed = false;
@@ -1349,11 +1464,77 @@ impl Studio {
                         });
                         ui.end_row();
                     }
+                    if !ollama {
+                        for (path, size) in &s.custom_embed {
+                            let active = *path == c.embedding_gguf;
+                            let name = file_name(path);
+                            let text = if active {
+                                RichText::new(format!("● {}", short(&name, 44)))
+                                    .strong()
+                                    .color(p.accent)
+                            } else {
+                                RichText::new(short(&name, 48))
+                            };
+                            ui.label(text).on_hover_text(path.display().to_string());
+                            ui.label(RichText::new(format_size(*size)).color(p.muted));
+                            ui.horizontal(|ui| {
+                                if active {
+                                    ui.label(RichText::new("In use").size(12.0).color(p.accent));
+                                } else if ui
+                                    .button("Use")
+                                    .on_hover_text("Use for Embedding rerank")
+                                    .clicked()
+                                {
+                                    c.embedding_gguf = path.clone();
+                                    if running {
+                                        actions.push(Action::EmbedStop);
+                                    }
+                                    changed = true;
+                                }
+                                if !active
+                                    && ui
+                                        .small_button("Remove")
+                                        .on_hover_text(
+                                            "Take it off this list and show it as a chat model; the file stays on disk",
+                                        )
+                                        .clicked()
+                                {
+                                    actions.push(Action::SetEmbedding(path.clone(), false));
+                                }
+                                if path.starts_with(&models_dir) && !(active && running) {
+                                    delete_button(ui, path, actions);
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    }
                 });
             if ollama {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut s.ollama_name)
+                            .hint_text("Ollama embedding model name")
+                            .desired_width(220.0),
+                    )
+                    .on_hover_text("A model Ollama has pulled, such as nomic-embed-text");
+                    let name = s.ollama_name.trim().to_string();
+                    if ui
+                        .add_enabled(!name.is_empty(), egui::Button::new("Add"))
+                        .on_hover_text("Use this Ollama model for Embedding rerank")
+                        .clicked()
+                    {
+                        c.embedding_model = name;
+                        s.ollama_name.clear();
+                        changed = true;
+                    }
+                });
                 return;
             }
-            if have && !is_embed_file(&custom) {
+            let listed = s
+                .custom_embed
+                .iter()
+                .any(|(path, _)| *path == c.embedding_gguf);
+            if have && !is_embed_file(&custom) && !listed {
                 ui.label(RichText::new(format!("● {}", short(&custom, 48))).color(p.accent))
                     .on_hover_text(c.embedding_gguf.display().to_string());
             }
@@ -1460,6 +1641,69 @@ mod tests {
                 .all(|m| is_embed_file(m.model.file))
         );
         assert!(!is_embed_file("Qwen2.5-3B-Instruct-Q4_K_M.gguf"));
+    }
+
+    #[test]
+    fn embedding_files_come_from_the_user_or_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("my-search.gguf");
+        let known = dir.path().join(setup::EMBED_MODEL.file);
+        let chat = dir.path().join("chat.gguf");
+        for path in [&custom, &known, &chat] {
+            fs::write(path, b"not read as a model").unwrap();
+        }
+        let mut config = crate::core::config::Config {
+            embed_models: vec![custom.clone()],
+            ..Default::default()
+        };
+        let mut state = ModelsState {
+            installed: vec![
+                (custom.clone(), 19),
+                (known.clone(), 19),
+                (chat.clone(), 19),
+            ],
+            ..Default::default()
+        };
+        state.scan(&config);
+        assert!(state.embed_paths.contains(&custom));
+        assert!(state.embed_paths.contains(&known), "known file name");
+        assert!(!state.embed_paths.contains(&chat));
+        assert_eq!(state.custom_embed.len(), 1);
+        // The user says a detected embedding file is a chat model.
+        config.chat_hidden = vec![known.clone()];
+        state.scan(&config);
+        assert!(!state.embed_paths.contains(&known));
+        // A file that is gone is not listed under Embeddings.
+        fs::remove_file(&custom).unwrap();
+        state.scan(&config);
+        assert!(state.custom_embed.is_empty());
+    }
+
+    #[test]
+    fn metadata_detected_embedding_files_are_listed() {
+        // A minimal GGUF v3 header whose general.architecture is "bert".
+        let mut data = b"GGUF".to_vec();
+        data.extend(3u32.to_le_bytes());
+        data.extend(0u64.to_le_bytes());
+        data.extend(1u64.to_le_bytes());
+        let key = b"general.architecture";
+        data.extend((key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key);
+        data.extend(8u32.to_le_bytes());
+        let value = b"bert";
+        data.extend((value.len() as u64).to_le_bytes());
+        data.extend_from_slice(value);
+        let dir = tempfile::tempdir().unwrap();
+        let detected = dir.path().join("detected.gguf");
+        fs::write(&detected, &data).unwrap();
+        let config = crate::core::config::Config::default();
+        let mut state = ModelsState {
+            installed: vec![(detected.clone(), data.len() as u64)],
+            ..Default::default()
+        };
+        state.scan(&config);
+        assert!(state.embed_paths.contains(&detected));
+        assert_eq!(state.custom_embed, vec![(detected, data.len() as u64)]);
     }
 
     #[test]

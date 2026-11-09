@@ -74,6 +74,12 @@ pub struct Config {
     /// "llama" (a second llama-server with --embedding) or "ollama".
     pub embedding_backend: String,
     pub embedding_gguf: PathBuf,
+    /// GGUF files the user marked as embedding models; the Models page lists them under Embeddings.
+    #[serde(default)]
+    pub embed_models: Vec<PathBuf>,
+    /// GGUF files the user marked as not embedding models, for files detection gets wrong.
+    #[serde(default)]
+    pub chat_hidden: Vec<PathBuf>,
     /// Per-model overrides, keyed by GGUF file name.
     pub model_presets: BTreeMap<String, crate::core::llama::ModelPreset>,
     pub low_end: bool,
@@ -165,6 +171,8 @@ impl Default for Config {
             settings_version: SETTINGS_VERSION,
             embedding_backend: "llama".into(),
             embedding_gguf: PathBuf::new(),
+            embed_models: vec![],
+            chat_hidden: vec![],
             model_presets: BTreeMap::new(),
             low_end: false,
             task_profiles: vec![],
@@ -511,6 +519,7 @@ mod tests {
         assert!(old.window_size.is_none());
         assert!(old.confirm_web_query && old.mcp_servers.is_empty());
         assert!(!old.rerank_user_set);
+        assert!(old.embed_models.is_empty() && old.chat_hidden.is_empty());
     }
     #[test]
     fn v5_migration_keeps_characters_on_and_enables_discord() {

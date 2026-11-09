@@ -1,6 +1,7 @@
 pub mod config;
 pub mod diagnostics;
 pub mod engine;
+pub mod gguf;
 pub mod git;
 pub mod hub;
 pub mod llama;

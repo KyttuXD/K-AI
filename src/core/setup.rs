@@ -1,10 +1,12 @@
 //! First-run setup: finds or downloads llama.cpp's `llama-server` and a GGUF
 //! model sized for this machine's RAM, with resumable, verified downloads.
 use super::config::{Config, data_dir};
+use super::gguf;
 use super::llama;
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{StatusCode, blocking::Client};
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -79,14 +81,22 @@ const NOMIC_EMBED: ModelChoice = ModelChoice {
 /// (`llama-server --embedding`): EMBED_MODELS[0], kept for existing callers.
 pub const EMBED_MODEL: ModelChoice = NOMIC_EMBED;
 
+/// Text put before each query and passage in the format the model was trained with.
+pub const NOMIC_QUERY: &str = "search_query: ";
+pub const NOMIC_DOCUMENT: &str = "search_document: ";
+pub const QWEN3_QUERY: &str = "Instruct: Given a search query, retrieve relevant passages\nQuery: ";
+
 /// An embedding model setup and the Models page can download, with the
-/// llama.cpp pooling it needs and its Ollama name. Derefs to its ModelChoice,
-/// so `choice.file` and `choice.model.file` both work.
+/// llama.cpp pooling it needs, its text marks and its Ollama name. Derefs to
+/// its ModelChoice, so `choice.file` and `choice.model.file` both work.
 #[derive(Clone, Copy)]
 pub struct EmbedChoice {
     pub model: ModelChoice,
     /// `llama-server --pooling` value.
     pub pooling: &'static str,
+    /// Put before each query and each passage (None: the text is used as is).
+    pub query_prefix: Option<&'static str>,
+    pub passage_prefix: Option<&'static str>,
     /// The same model in Ollama (`ollama pull <tag>`).
     pub ollama_tag: &'static str,
 }
@@ -103,6 +113,8 @@ pub const EMBED_MODELS: &[EmbedChoice] = &[
     EmbedChoice {
         model: NOMIC_EMBED,
         pooling: "mean",
+        query_prefix: Some(NOMIC_QUERY),
+        passage_prefix: Some(NOMIC_DOCUMENT),
         ollama_tag: "nomic-embed-text",
     },
     EmbedChoice {
@@ -115,6 +127,8 @@ pub const EMBED_MODELS: &[EmbedChoice] = &[
             min_ram_gb: 8,
         },
         pooling: "last",
+        query_prefix: Some(QWEN3_QUERY),
+        passage_prefix: None,
         ollama_tag: "qwen3-embedding:4b",
     },
 ];
@@ -124,6 +138,73 @@ pub fn embed_choice(file_name: &str) -> Option<&'static EmbedChoice> {
     EMBED_MODELS
         .iter()
         .find(|c| c.model.file.eq_ignore_ascii_case(file_name.trim()))
+}
+
+/// How an embedding GGUF is served and fed: the llama.cpp pooling and the text
+/// marks put around queries and passages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbedProfile {
+    /// `llama-server --pooling` value: mean, cls, last or rank.
+    pub pooling: String,
+    pub query_prefix: Option<String>,
+    pub passage_prefix: Option<String>,
+}
+
+/// The profile of the embedding GGUF at `path`. A known file name (EMBED_MODELS)
+/// keeps its pooling and marks. Any other file takes its pooling from the GGUF
+/// metadata (none counts as mean; a Qwen3-Embedding name without metadata pools on
+/// the last token) and its marks from its name. Other names get no marks. Custom
+/// files are cached per path and size, so each header is read once.
+pub fn embed_profile(path: &Path) -> EmbedProfile {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(choice) = embed_choice(&name) {
+        return EmbedProfile {
+            pooling: choice.pooling.into(),
+            query_prefix: choice.query_prefix.map(str::to_string),
+            passage_prefix: choice.passage_prefix.map(str::to_string),
+        };
+    }
+    static CUSTOM: OnceLock<Mutex<HashMap<(PathBuf, u64), EmbedProfile>>> = OnceLock::new();
+    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let cache = CUSTOM.get_or_init(Default::default);
+    let key = (path.to_path_buf(), size);
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return hit.clone();
+    }
+    let profile = custom_profile(path, &name);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, profile.clone());
+    profile
+}
+
+/// The profile of a file with no known name, read from its metadata and name.
+fn custom_profile(path: &Path, name: &str) -> EmbedProfile {
+    let lower = name.to_ascii_lowercase();
+    let pooling = match gguf::read_info(path).and_then(|info| info.pooling) {
+        Some(p) if p != "none" => p,
+        _ if lower.contains("qwen3-embedding") => "last".into(),
+        _ => "mean".into(),
+    };
+    let (query_prefix, passage_prefix) = if lower.contains("qwen3-embedding") {
+        (Some(QWEN3_QUERY.to_string()), None)
+    } else if lower.contains("nomic-embed") {
+        (
+            Some(NOMIC_QUERY.to_string()),
+            Some(NOMIC_DOCUMENT.to_string()),
+        )
+    } else {
+        (None, None)
+    };
+    EmbedProfile {
+        pooling,
+        query_prefix,
+        passage_prefix,
+    }
 }
 
 /// The known embedding model with this Ollama name ("nomic-embed-text" and
@@ -1121,5 +1202,83 @@ mod tests {
     fn ready_stage_lists_notes() {
         assert_eq!(ready_stage(&[]), "Ready");
         assert_eq!(ready_stage(&["a".into(), "b".into()]), "Ready (a; b)");
+    }
+    /// A GGUF v3 header with general.architecture and, optionally, <arch>.pooling_type.
+    fn write_gguf(dir: &Path, name: &str, arch: &str, pooling: Option<u32>) -> PathBuf {
+        fn string(b: &mut Vec<u8>, s: &str) {
+            b.extend((s.len() as u64).to_le_bytes());
+            b.extend(s.as_bytes());
+        }
+        let mut b = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend((1 + u64::from(pooling.is_some())).to_le_bytes());
+        string(&mut b, "general.architecture");
+        b.extend(8u32.to_le_bytes());
+        string(&mut b, arch);
+        if let Some(p) = pooling {
+            string(&mut b, &format!("{arch}.pooling_type"));
+            b.extend(4u32.to_le_bytes());
+            b.extend(p.to_le_bytes());
+        }
+        let path = dir.join(name);
+        fs::write(&path, b).unwrap();
+        path
+    }
+    #[test]
+    fn known_embedding_files_keep_pooling_and_marks() {
+        let nomic = embed_profile(&embed_path(&EMBED_MODELS[0]));
+        assert_eq!(nomic.pooling, "mean");
+        assert_eq!(nomic.query_prefix.as_deref(), Some("search_query: "));
+        assert_eq!(nomic.passage_prefix.as_deref(), Some("search_document: "));
+        let qwen = embed_profile(Path::new("/m/Qwen3-Embedding-4B-Q4_K_M.gguf"));
+        assert_eq!(qwen.pooling, "last");
+        assert_eq!(qwen.query_prefix.as_deref(), Some(QWEN3_QUERY));
+        assert_eq!(qwen.passage_prefix, None);
+        // The name decides for a known file, whatever its metadata says.
+        let dir = tempfile::tempdir().unwrap();
+        let named = write_gguf(dir.path(), EMBED_MODEL.file, "bert", Some(2));
+        assert_eq!(embed_profile(&named).pooling, "mean");
+    }
+    #[test]
+    fn custom_embedding_files_take_pooling_from_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let cls = write_gguf(dir.path(), "bge-custom.gguf", "bert", Some(2));
+        let p = embed_profile(&cls);
+        assert_eq!(p.pooling, "cls");
+        assert_eq!((p.query_prefix, p.passage_prefix), (None, None));
+        let last = write_gguf(dir.path(), "my-qwen.gguf", "qwen3", Some(3));
+        assert_eq!(embed_profile(&last).pooling, "last");
+        let mean = write_gguf(dir.path(), "my-mean.gguf", "bert", Some(1));
+        assert_eq!(embed_profile(&mean).pooling, "mean");
+        // A "none" pooling is served as mean.
+        let none = write_gguf(dir.path(), "my-none.gguf", "bert", Some(0));
+        assert_eq!(embed_profile(&none).pooling, "mean");
+        // Metadata without a pooling key: mean.
+        let bare = write_gguf(dir.path(), "my-bare.gguf", "llama", None);
+        assert_eq!(embed_profile(&bare).pooling, "mean");
+    }
+    #[test]
+    fn custom_embedding_files_get_marks_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let nomic_like = write_gguf(dir.path(), "nomic-custom.gguf", "nomic-bert", Some(1));
+        let p = embed_profile(&nomic_like);
+        assert_eq!((p.query_prefix, p.passage_prefix), (None, None));
+        let nomic = write_gguf(dir.path(), "nomic-embed-custom.gguf", "nomic-bert", Some(1));
+        let p = embed_profile(&nomic);
+        assert_eq!(
+            (p.query_prefix, p.passage_prefix),
+            (Some(NOMIC_QUERY.into()), Some(NOMIC_DOCUMENT.into()))
+        );
+        // An unreadable file is mean, with no marks.
+        let missing = embed_profile(&dir.path().join("absent.gguf"));
+        assert_eq!(missing.pooling, "mean");
+        assert_eq!((missing.query_prefix, missing.passage_prefix), (None, None));
+        // Other Qwen3-Embedding quants keep last-token pooling without metadata.
+        let quant = embed_profile(Path::new("Qwen3-Embedding-0.6B-f16.gguf"));
+        assert_eq!(
+            (quant.pooling.as_str(), quant.query_prefix),
+            ("last", Some(QWEN3_QUERY.into()))
+        );
     }
 }
