@@ -1510,9 +1510,20 @@ impl EventHandler for Handler {
         let auto = self.profile.auto_channels_enabled
             && self.guild_allowed(guild)
             && guild.is_some_and(|g| self.is_auto_channel(g, channel));
+        // `@bot hello` does the same as `<prefix> hello`. Auto channels keep their own handling
+        // of mentions (cooldowns, newest message only).
+        let content = if auto {
+            None
+        } else {
+            mention_as_prefixed(
+                &msg.content,
+                self.own_id.load(Ordering::SeqCst),
+                &self.profile.prefix,
+            )
+        };
+        let content = content.as_deref().unwrap_or(&msg.content);
         if !from_bot
-            && let Some(command) =
-                parse_command(&msg.content, &self.profile.prefix, self.features())
+            && let Some(command) = parse_command(content, &self.profile.prefix, self.features())
         {
             // `auto on` works in any channel of an allowed server, so admins can add one.
             let anywhere = matches!(command, Command::Auto(_)) && self.guild_allowed(guild);
@@ -1546,6 +1557,18 @@ fn auto_text(content: &str, own: u64) -> Option<String> {
         text = rest[end + 1..].trim();
     }
     (!text.is_empty()).then(|| text.to_owned())
+}
+/// A message that starts with a mention of this bot, rewritten with the command prefix instead
+/// (`<@7> play x` becomes `!ai play x`). None for anything else, or a bare mention.
+fn mention_as_prefixed(content: &str, own: u64, prefix: &str) -> Option<String> {
+    let rest = content.trim().strip_prefix("<@")?;
+    let rest = rest.strip_prefix('!').unwrap_or(rest);
+    let end = rest.find('>')?;
+    if rest[..end].parse::<u64>().ok()? != own {
+        return None;
+    }
+    let text = rest[end + 1..].trim();
+    (!text.is_empty()).then(|| format!("{prefix} {text}"))
 }
 /// A bot's message may get a reply only without @everyone/@here and with few mentions.
 fn bot_message_ok(content: &str, mention_everyone: bool, mentions: usize) -> bool {
@@ -2225,6 +2248,17 @@ mod tests {
             assert_eq!(auto_text(skipped, 7), None, "{skipped:?}");
         }
         // Addressed to this bot: the mention is removed. To someone else: skipped.
+        assert_eq!(
+            mention_as_prefixed("<@7> hello", 7, "!ai").as_deref(),
+            Some("!ai hello")
+        );
+        assert_eq!(
+            mention_as_prefixed("<@!7> play x", 7, "!ai").as_deref(),
+            Some("!ai play x")
+        );
+        assert_eq!(mention_as_prefixed("<@8> hello", 7, "!ai"), None);
+        assert_eq!(mention_as_prefixed("<@7>", 7, "!ai"), None);
+        assert_eq!(mention_as_prefixed("hi <@7>", 7, "!ai"), None);
         assert_eq!(auto_text("<@7> hi", 7).as_deref(), Some("hi"));
         assert_eq!(auto_text("<@!7> hi", 7).as_deref(), Some("hi"));
         assert_eq!(auto_text("<@8> hi", 7), None);

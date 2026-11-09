@@ -467,9 +467,9 @@ impl Library {
     pub fn remove_source(&self, id: &str) {
         self.indexed.lock().unwrap().remove(id);
         self.queued.lock().unwrap().retain(|s| s.id != id);
-        if let Some(active) = self.active.lock().unwrap().as_mut() {
-            active.retain(|s| s.id != id);
-        }
+        // `active` is the configured source list that searches use; only the settings change
+        // it (through `matches_sources`). Dropping the source from it here made every search
+        // return nothing after Rebuild, because rebuilding does not change the settings.
         let (library, id) = (self.clone(), id.to_owned());
         self.removing.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
@@ -1301,6 +1301,32 @@ mod tests {
         drop(c);
         drop(library);
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn search_still_works_after_a_rebuild_of_a_source() -> Result<()> {
+        // The Rebuild button removes the source's passages and indexes it again; the settings
+        // (and so the list of sources to search) stay the same throughout.
+        let dir = temp("rebuild-search");
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs)?;
+        std::fs::write(docs.join("a.md"), "# Godot\nthe godot engine")?;
+        let linked = source("d", "docs", &docs);
+        let library = Library::new(dir.join("index.sqlite"));
+        library.index(std::slice::from_ref(&linked))?;
+        assert!(library.matches_sources(std::slice::from_ref(&linked)));
+        assert_eq!(library.search("godot", "", 4)?.len(), 1);
+        library.remove_source(&linked.id);
+        // Wait for the background delete, then index again as the page does.
+        for _ in 0..200 {
+            if library.removing.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        library.index(std::slice::from_ref(&linked))?;
+        assert_eq!(library.search("godot", "", 4)?.len(), 1);
+        assert_eq!(library.search("godot", "docs", 4)?.len(), 1);
         Ok(())
     }
     #[test]
