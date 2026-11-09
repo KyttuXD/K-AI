@@ -86,15 +86,56 @@ pub fn definitions(set: &ToolSet) -> Value {
     Value::Array(tools)
 }
 
+/// `name` relative to the workspace when it is an absolute path inside it. Small models often
+/// send the full path of a workspace file; doubled backslashes and either slash style are
+/// tolerated. None for anything else (including paths outside the workspace).
+fn inside_workspace(root: &Path, name: &str) -> Option<String> {
+    let flat = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            let c = if c == '\\' { '/' } else { c };
+            if !(c == '/' && out.ends_with('/')) {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let (n, r) = (flat(name), flat(&root.to_string_lossy()));
+    let r = r.trim_end_matches('/');
+    let head = n.get(..r.len())?;
+    let same = if cfg!(windows) {
+        head.eq_ignore_ascii_case(r)
+    } else {
+        head == r
+    };
+    let rest = n[r.len()..].strip_prefix('/')?;
+    (same && !rest.is_empty()).then(|| rest.to_owned())
+}
+
+/// The error for a path that is not allowed, with the fix the model needs.
+fn path_hint(root: &Path, name: &str) -> String {
+    let leaf = name
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or("file.txt");
+    format!(
+        "Only paths relative to the workspace are allowed. The workspace is {}; use a short path inside it, for example \"{leaf}\" or \"src/{leaf}\".",
+        root.display()
+    )
+}
+
 pub fn resolve(root: &Path, name: &str) -> Result<PathBuf> {
     ensure!(!name.is_empty(), "A relative file path is required");
+    let relative = inside_workspace(root, name);
+    let name = relative.as_deref().unwrap_or(name);
     let input = Path::new(name);
     ensure!(
         !input.is_absolute()
             && input
                 .components()
                 .all(|c| matches!(c, Component::Normal(_) | Component::CurDir)),
-        "Only relative workspace paths are allowed"
+        "{}",
+        path_hint(root, name)
     );
     // Reject Windows alternate data streams, device aliases, and shell-like path syntax.
     ensure!(
@@ -952,6 +993,45 @@ mod tests {
         let listed = list_ignored_aware(root);
         assert!(listed.contains(&"src/main.rs".into()) && listed.contains(&".gitignore".into()));
         assert!(!listed.contains(&"notes.log".into()));
+        Ok(())
+    }
+    #[test]
+    fn absolute_paths_inside_the_workspace_become_relative() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("proj");
+        std::fs::create_dir(&root)?;
+        let full = root.join("hello.txt");
+        let shown = full.to_string_lossy().to_string();
+        // The full path, the doubled-backslash form a small model sent, and forward slashes.
+        assert_eq!(
+            inside_workspace(&root, &shown).as_deref(),
+            Some("hello.txt")
+        );
+        let doubled = shown.replace('\\', "\\\\");
+        assert_eq!(
+            inside_workspace(&root, &doubled).as_deref(),
+            Some("hello.txt")
+        );
+        assert_eq!(
+            inside_workspace(&root, &shown.replace('\\', "/")).as_deref(),
+            Some("hello.txt")
+        );
+        // The workspace itself, a sibling folder with the same prefix, and other places stay out.
+        assert_eq!(inside_workspace(&root, &root.to_string_lossy()), None);
+        let sibling = format!("{}2{}hello.txt", root.display(), std::path::MAIN_SEPARATOR);
+        assert_eq!(inside_workspace(&root, &sibling), None);
+        assert_eq!(inside_workspace(&root, "hello.txt"), None);
+        // resolve() accepts the full path and still refuses anything that escapes.
+        assert_eq!(
+            resolve(&root, &shown)?,
+            root.canonicalize()?.join("hello.txt")
+        );
+        assert!(resolve(&root, &format!("{shown}/../../x")).is_err());
+        let outside = temp.path().join("other.txt");
+        let err = resolve(&root, &outside.to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("relative to the workspace") && err.contains("other.txt"));
         Ok(())
     }
     #[test]

@@ -12,7 +12,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ops::Range,
     path::Path,
     sync::{
@@ -254,6 +254,8 @@ const KEPT_TURNS: usize = 40;
 const IMAGE_CHARS: usize = 3000;
 /// Tools offered from MCP servers in one request.
 const MAX_MCP_TOOLS: usize = 64;
+/// Consecutive failing tool calls after which a run stops instead of using up its steps.
+const MAX_TOOL_FAILURES: usize = 6;
 
 /// An MCP server tool offered to the model as `mcp__<server>__<tool>`.
 struct McpTool {
@@ -270,6 +272,8 @@ struct Turn {
     sources: Vec<Source>,
     reads: HashSet<String>,
     declined: HashSet<String>,
+    /// Calls that failed this turn (by name and arguments) and why.
+    failed: HashMap<String, String>,
     mcp: Vec<McpTool>,
     checkpointed: bool,
 }
@@ -530,9 +534,15 @@ fn execute(
         }
         "run_command" => {
             let program = arg("program")?;
-            let args = args["args"]
+            // Some models send the list as a JSON string ("[\"a\", \"b\"]") or leave it out.
+            let list = match &args["args"] {
+                Value::String(raw) => serde_json::from_str::<Value>(raw).unwrap_or(Value::Null),
+                Value::Null => json!([]),
+                other => other.clone(),
+            };
+            let args = list
                 .as_array()
-                .context("args must be an array")?
+                .context("args must be an array of strings, e.g. [\"-l\"]")?
                 .iter()
                 .map(|v| {
                     v.as_str()
@@ -1217,6 +1227,8 @@ fn agent_loop(
             && super::provider::prefill_ok(&req.config)
     });
     let (mut steps, mut rounds, mut noted) = (0, 0, 0);
+    // Tool calls that failed one after another; the run stops when a model cannot recover.
+    let mut failures = 0;
     while steps < max_steps && rounds < max_steps * 2 {
         rounds += 1;
         ensure!(!req.cancel.load(Ordering::Relaxed), "Stopped");
@@ -1280,6 +1292,10 @@ fn agent_loop(
             let repeat_read = matches!(name, "read_file" | "list_files");
             let result = if turn.declined.contains(&fingerprint) {
                 "This exact action was already declined. Do not retry it.".into()
+            } else if let Some(why) = turn.failed.get(&fingerprint) {
+                format!(
+                    "This exact call already failed this turn ({why}). Do not repeat it: change the arguments, use a different tool, or tell the user what is blocking you."
+                )
             } else if repeat_read && turn.reads.contains(&fingerprint) {
                 "Already done: this identical call ran earlier in this turn. Use the earlier result above.".into()
             } else {
@@ -1301,9 +1317,24 @@ fn agent_loop(
                         }
                         text
                     }
-                    Err(e) => format!("Tool error: {e:#}"),
+                    Err(e) => {
+                        let why = format!("{e:#}");
+                        turn.failed.insert(fingerprint, why.clone());
+                        format!("Tool error: {why}")
+                    }
                 }
             };
+            if result.starts_with("Tool error:")
+                || result.starts_with("This exact call already failed")
+            {
+                failures += 1;
+            } else {
+                failures = 0;
+            }
+            ensure!(
+                failures < MAX_TOOL_FAILURES,
+                "Stopped: the model kept making tool calls that fail ({result}). Try rephrasing, or use a larger model."
+            );
             let _ = tx.send(Event::Activity(format!(
                 "{name}: {}",
                 result.chars().take(180).collect::<String>()
