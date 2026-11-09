@@ -6,12 +6,14 @@ use super::*;
 use crate::ui::icons;
 
 /// Longest the stack shows at once; older notices wait underneath and keep their timers.
-const MAX_VISIBLE: usize = 4;
+const MAX_VISIBLE: usize = 3;
+/// Errors go away by themselves too, so a run of failures cannot pile up over the window.
+const ERROR_SECS: f32 = 12.0;
 const INFO_SECS: f32 = 4.0;
 const UNDO_SECS: f32 = 8.0;
 const FADE_IN: f32 = 0.15;
 const FADE_OUT: f32 = 0.5;
-const MAX_CHARS: usize = 600;
+const MAX_CHARS: usize = 280;
 const WIDTH: f32 = 320.0;
 
 type UndoFn = Box<dyn FnOnce(&mut Studio) + Send>;
@@ -45,7 +47,7 @@ fn lifetime(kind: Kind) -> Option<Duration> {
     match kind {
         Kind::Info => Some(Duration::from_secs_f32(INFO_SECS)),
         Kind::Undo => Some(Duration::from_secs_f32(UNDO_SECS)),
-        Kind::Error => None,
+        Kind::Error => Some(Duration::from_secs_f32(ERROR_SECS)),
     }
 }
 
@@ -148,7 +150,7 @@ impl Studio {
         self.notices.push(Kind::Info, text.into(), Instant::now());
     }
 
-    /// Error toast: stays until dismissed; the same text is shown once.
+    /// Error toast: fades after a while or can be dismissed; the same text is shown once.
     pub(super) fn error_toast(&mut self, text: impl Into<String>) {
         self.notices.push(Kind::Error, text.into(), Instant::now());
     }
@@ -187,22 +189,38 @@ impl Studio {
         let mut action = None;
         let mut animating = false;
         let first = visible_start(self.notices.items.len());
+        let hidden = first;
+        let max_height = ctx.content_rect().height() * 0.45;
         egui::Area::new(egui::Id::new("kyttu_notices"))
             .order(egui::Order::Tooltip)
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -96.0))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
-                for n in &self.notices.items[first..] {
-                    let age = now.saturating_duration_since(n.born);
-                    let alpha = fade_alpha(n.kind, age);
-                    animating |= alpha < 1.0;
-                    ui.scope(|ui| {
-                        ui.multiply_opacity(alpha);
-                        if let Some(a) = draw_notice(ui, &p, n) {
-                            action = Some(a);
+                if hidden > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "{hidden} more notice{} waiting",
+                            if hidden == 1 { "" } else { "s" }
+                        ))
+                        .size(11.0)
+                        .color(p.muted),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .show(ui, |ui| {
+                        for n in &self.notices.items[first..] {
+                            let age = now.saturating_duration_since(n.born);
+                            let alpha = fade_alpha(n.kind, age);
+                            animating |= alpha < 1.0;
+                            ui.scope(|ui| {
+                                ui.multiply_opacity(alpha);
+                                if let Some(a) = draw_notice(ui, &p, n) {
+                                    action = Some(a);
+                                }
+                            });
                         }
                     });
-                }
             });
         // Fades need smooth frames; between them a slow tick is enough for the timers.
         if animating {
@@ -292,7 +310,8 @@ mod tests {
         assert!(is_expired(Kind::Info, secs(4.0)));
         assert!(!is_expired(Kind::Undo, secs(7.9)));
         assert!(is_expired(Kind::Undo, secs(8.0)));
-        assert!(!is_expired(Kind::Error, secs(10_000.0)));
+        assert!(!is_expired(Kind::Error, secs(11.9)));
+        assert!(is_expired(Kind::Error, secs(12.0)));
     }
 
     #[test]
@@ -302,15 +321,16 @@ mod tests {
         let end = fade_alpha(Kind::Info, secs(3.8));
         assert!(end > 0.0 && end < 1.0);
         assert_eq!(fade_alpha(Kind::Info, secs(4.0)), 0.0);
-        assert_eq!(fade_alpha(Kind::Error, secs(500.0)), 1.0);
+        assert_eq!(fade_alpha(Kind::Error, secs(1.0)), 1.0);
+        assert_eq!(fade_alpha(Kind::Error, secs(12.0)), 0.0);
     }
 
     #[test]
     fn newest_are_visible() {
         assert_eq!(visible_start(0), 0);
-        assert_eq!(visible_start(4), 0);
-        assert_eq!(visible_start(5), 1);
-        assert_eq!(visible_start(10), 6);
+        assert_eq!(visible_start(3), 0);
+        assert_eq!(visible_start(4), 1);
+        assert_eq!(visible_start(10), 7);
     }
 
     #[test]
