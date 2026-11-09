@@ -26,7 +26,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     time::{Duration, Instant},
@@ -143,6 +143,8 @@ pub struct BotProfile {
     pub server_characters: bool,
     pub server_char_limit: usize,
     pub server_char_max_kb: usize,
+    /// Answer as the plain agent even when characters are available on Discord.
+    pub no_character: bool,
 }
 impl Default for BotProfile {
     fn default() -> Self {
@@ -164,6 +166,7 @@ impl Default for BotProfile {
             server_characters: false,
             server_char_limit: 10,
             server_char_max_kb: 32,
+            no_character: false,
         }
     }
 }
@@ -287,6 +290,8 @@ pub struct Discord {
     pub running: Arc<AtomicBool>,
     stop: Mutex<Arc<StopSignal>>,
     replies: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    /// App characters available on Discord for the bot that last connected.
+    available: Arc<AtomicUsize>,
 }
 impl Default for Discord {
     fn default() -> Self {
@@ -295,10 +300,15 @@ impl Default for Discord {
             running: Arc::new(AtomicBool::new(false)),
             stop: Mutex::new(Arc::default()),
             replies: Arc::new(Mutex::new(HashMap::new())),
+            available: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 impl Discord {
+    /// How many characters this bot can answer as on Discord (0 = it answers as the plain agent).
+    pub fn available_characters(&self) -> usize {
+        self.available.load(Ordering::Relaxed)
+    }
     pub fn disconnect(&self) {
         self.stop.lock().unwrap().set();
         self.stop_replies();
@@ -378,6 +388,12 @@ impl Discord {
         let hook_ids: Vec<u64> = hooks.values().filter_map(|url| webhook_id(url)).collect();
         register_ids(&APP_WEBHOOKS, &hook_ids);
         let own_id = Arc::new(AtomicU64::new(0));
+        let characters = if profile.no_character {
+            0
+        } else {
+            config.personas.iter().filter(|p| p.discord).count()
+        };
+        self.available.store(characters, Ordering::Relaxed);
         let (use_voice, use_reactions) = (profile.tools.music, profile.tools.moderation);
         let mut handler = Handler {
             memory: memory.clone(),
@@ -726,6 +742,18 @@ fn short(text: &str) -> String {
 impl Handler {
     fn set_status(&self, text: impl Into<String>) {
         *self.status.lock().unwrap() = text.into();
+    }
+    /// "N characters available on Discord" for the status line (app characters only).
+    fn characters_note(&self) -> String {
+        let n = if self.profile.no_character {
+            0
+        } else {
+            self.config.personas.iter().filter(|p| p.discord).count()
+        };
+        match n {
+            1 => "1 character available on Discord".into(),
+            n => format!("{n} characters available on Discord"),
+        }
     }
     fn features(&self) -> Features {
         Features {
@@ -1110,13 +1138,13 @@ impl Handler {
             Command::Group(_) | Command::Ask(_) => {}
         }
         let personas = self.personas_for(guild);
-        if !personas.iter().any(|p| p.discord) {
-            if !trigger.auto {
-                out.say("No characters are available on Discord yet. Turn on \"Available on Discord\" for a character in KYTTU - AI.").await;
-            }
-            return Outcome::Done;
-        }
-        let (selected, question) = select_personas(&command, &personas, self.profile.group);
+        // No characters (or the bot is set to none): the plain agent answers, never a notice.
+        let plain = self.profile.no_character || !personas.iter().any(|p| p.discord);
+        let (selected, question) = if plain {
+            plain_selection(&command)
+        } else {
+            select_personas(&command, &personas, self.profile.group)
+        };
         if question.is_empty() {
             return Outcome::Done;
         }
@@ -1175,7 +1203,8 @@ impl Handler {
             if self.stop.is_set() || cancel.load(Ordering::Relaxed) {
                 break;
             }
-            self.set_status(format!("{} is responding…", persona.name));
+            let name = display_name(persona, &self.profile.name);
+            self.set_status(format!("{name} is responding…"));
             let config = self.config.clone();
             let persona_model = persona.model.clone();
             let mut request = Request {
@@ -1192,7 +1221,6 @@ impl Handler {
                 use_embeddings: false,
                 tool_host: host.clone(),
             };
-            let name = persona.name.chars().take(80).collect::<String>();
             let (bot_stop, limit) = (self.stop.clone(), self.profile.reply_timeout_secs);
             let live = Arc::new(Mutex::new(String::new()));
             let worker_live = live.clone();
@@ -1231,10 +1259,7 @@ impl Handler {
                 break;
             };
             if timed_out {
-                let text = format!(
-                    "{} hit the {limit}s time limit and was stopped.",
-                    persona.name
-                );
+                let text = format!("{name} hit the {limit}s time limit and was stopped.");
                 out.say(&text).await;
                 break;
             }
@@ -1284,7 +1309,10 @@ impl Handler {
             self.schedule_flush();
         }
         if !failed && !self.stop.is_set() {
-            self.set_status("Connected · waiting for a message");
+            self.set_status(format!(
+                "Connected · waiting for a message · {}",
+                self.characters_note()
+            ));
         }
         Outcome::Done
     }
@@ -1452,9 +1480,10 @@ impl EventHandler for Handler {
             ""
         };
         let connected = format!(
-            "Connected as {} · {} channel(s){auto}",
+            "Connected as {} · {} channel(s){auto} · {}",
             ready.user.name,
-            self.channels.len()
+            self.channels.len(),
+            self.characters_note()
         );
         self.set_status(connected.clone());
         let guilds = ready.guilds.iter().map(|g| g.id).collect();
@@ -1970,6 +1999,25 @@ fn select_personas(
             question.trim().into(),
         )
     }
+}
+/// The name shown above a reply: the character's, or the bot's own when answering as the
+/// plain agent. At most 80 characters.
+fn display_name(persona: &Persona, bot: &str) -> String {
+    let name = persona.name.trim();
+    let name = if name.is_empty() { bot.trim() } else { name };
+    match name.chars().take(80).collect::<String>() {
+        name if name.is_empty() => "Bot".into(),
+        name => name,
+    }
+}
+/// The plain agent (no character) and the question for a command, used when no character
+/// applies. A group or `@Name` message is just a question here.
+fn plain_selection(command: &Command) -> (Vec<Persona>, String) {
+    let question = match command {
+        Command::Group(question) | Command::Ask(question) => question.trim(),
+        _ => return (vec![], String::new()),
+    };
+    (vec![Persona::default()], question.into())
 }
 fn message_chunks(text: &str) -> Vec<String> {
     let (mut chunks, mut current, mut units) = (vec![], String::new(), 0);

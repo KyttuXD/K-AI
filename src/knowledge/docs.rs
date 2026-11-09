@@ -246,10 +246,7 @@ fn import_into(
         enabled: true,
     })
 }
-/// Deletes an Imported source's copy. Refuses anything outside `library_dir()`.
-pub fn delete_imported(source: &DocSource) -> Result<()> {
-    delete_within(&library_dir(), source)
-}
+#[cfg(test)]
 fn delete_within(library: &Path, source: &DocSource) -> Result<()> {
     anyhow::ensure!(
         source.mode == SourceMode::Imported,
@@ -466,7 +463,7 @@ impl Library {
         });
     }
     /// Drops a source's passages in the background; rebuilds requested meanwhile run after it.
-    /// Deleting an Imported copy is separate (`delete_imported`).
+    /// Deleting an Imported copy is separate (`trash::stage`).
     pub fn remove_source(&self, id: &str) {
         self.indexed.lock().unwrap().remove(id);
         self.queued.lock().unwrap().retain(|s| s.id != id);

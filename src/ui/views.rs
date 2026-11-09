@@ -2,13 +2,13 @@ use super::*;
 
 /// Sidebar navigation: icon, label and the view index it opens.
 const NAV: [(&str, &str, usize); 7] = [
-    ("💬", "Chat", 0),
-    ("📚", "Library", 1),
-    ("📦", "Models", 5),
-    ("🛠", "Workbench", 6),
-    ("👥", "Characters", 4),
-    ("🔌", "Connections", 2),
-    ("⚙", "Settings", 3),
+    (icons::CHAT, "Chat", 0),
+    (icons::LIBRARY, "Library", 1),
+    (icons::MODELS, "Models", 5),
+    (icons::WORKBENCH, "Workbench", 6),
+    (icons::CHARACTERS, "Characters", 4),
+    (icons::CONNECTIONS, "Connections", 2),
+    (icons::SETTINGS, "Settings", 3),
 ];
 
 /// What a click in the message list asks for, applied after the list is drawn.
@@ -197,7 +197,9 @@ impl Studio {
                         .add_sized(
                             [width, 30.0],
                             egui::Button::new(
-                                RichText::new("+  New chat").color(p.on_accent).strong(),
+                                RichText::new(icons::label(icons::NEW_CHAT, "New chat"))
+                                    .color(p.on_accent)
+                                    .strong(),
                             )
                             .fill(p.accent)
                             .corner_radius(8),
@@ -211,13 +213,15 @@ impl Studio {
                 });
                 ui.add_space(8.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
-                for (_, label, view) in NAV {
+                for (icon, label, view) in NAV {
                     let selected = self.view == view;
-                    let button = egui::Button::new(RichText::new(label).color(if selected {
-                        p.accent
-                    } else {
-                        p.text
-                    }))
+                    let button = egui::Button::new(
+                        RichText::new(icons::label(icon, label)).color(if selected {
+                            p.accent
+                        } else {
+                            p.text
+                        }),
+                    )
                     .fill(if selected { p.selected } else { p.panel })
                     .corner_radius(6);
                     let response = ui.add_sized([width, 28.0], button);
@@ -272,7 +276,10 @@ impl Studio {
                     let new = ui.add_enabled(
                         self.worker.is_none(),
                         egui::Button::new(
-                            RichText::new("+").color(p.on_accent).strong().size(16.0),
+                            RichText::new(icons::NEW_CHAT)
+                                .color(p.on_accent)
+                                .strong()
+                                .size(16.0),
                         )
                         .fill(p.accent)
                         .corner_radius(8)
@@ -307,7 +314,7 @@ impl Studio {
         if self.conversations.len() > 5 {
             ui.add(
                 egui::TextEdit::singleline(&mut self.conversation_search)
-                    .hint_text("Search chats")
+                    .hint_text(icons::label(icons::SEARCH, "Search chats"))
                     .desired_width(width),
             );
         }
@@ -356,7 +363,7 @@ impl Studio {
                     let is_pinned = pinned.contains(meta.id.as_str());
                     ui.horizontal(|ui| {
                         let title = if is_pinned {
-                            format!("📌 {}", meta.title)
+                            format!("{} {}", icons::PIN, meta.title)
                         } else {
                             meta.title.clone()
                         };
@@ -378,25 +385,44 @@ impl Studio {
                         if response.clicked() {
                             action = Some(ChatAction::Open(meta.id.clone()));
                         }
-                        ui.menu_button(RichText::new("…").color(p.muted), |ui| {
-                            if ui.button("Rename").clicked() {
-                                action =
-                                    Some(ChatAction::Rename(meta.id.clone(), meta.title.clone()));
-                                ui.close();
-                            }
-                            if ui.button(if is_pinned { "Unpin" } else { "Pin" }).clicked() {
-                                action = Some(ChatAction::Pin(meta.id.clone()));
-                                ui.close();
-                            }
-                            if ui.button("Export as Markdown…").clicked() {
-                                action = Some(ChatAction::Export(meta.id.clone()));
-                                ui.close();
-                            }
-                            if ui.add_enabled(idle, egui::Button::new("Delete")).clicked() {
-                                action = Some(ChatAction::Delete(meta.id.clone()));
-                                ui.close();
-                            }
-                        });
+                        let more =
+                            ui.menu_button(RichText::new(icons::MORE).color(p.muted), |ui| {
+                                if ui.button(icons::label(icons::EDIT, "Rename")).clicked() {
+                                    action = Some(ChatAction::Rename(
+                                        meta.id.clone(),
+                                        meta.title.clone(),
+                                    ));
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(icons::label(
+                                        icons::PIN,
+                                        if is_pinned { "Unpin" } else { "Pin" },
+                                    ))
+                                    .clicked()
+                                {
+                                    action = Some(ChatAction::Pin(meta.id.clone()));
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(icons::label(icons::EXPORT, "Export as Markdown…"))
+                                    .clicked()
+                                {
+                                    action = Some(ChatAction::Export(meta.id.clone()));
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        idle,
+                                        egui::Button::new(icons::label(icons::TRASH, "Delete")),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(ChatAction::Delete(meta.id.clone()));
+                                    ui.close();
+                                }
+                            });
+                        more.response.on_hover_text("Chat actions");
                     });
                 }
             });
@@ -423,7 +449,11 @@ impl Studio {
             Self::eyebrow(ui, "PROJECT");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(idle, |ui| {
-                    if ui.small_button("Open…").on_hover_text("Ctrl+O").clicked() {
+                    if ui
+                        .small_button(icons::OPEN_FOLDER)
+                        .on_hover_text("Open a folder (Ctrl+O)")
+                        .clicked()
+                    {
                         self.choose_workspace();
                     }
                 });
@@ -472,7 +502,10 @@ impl Studio {
             }
             if !self.config.projects.is_empty() {
                 ui.separator();
-                if ui.button("Clear list").clicked() {
+                if ui
+                    .button(icons::label(icons::CLOSE, "Clear list"))
+                    .clicked()
+                {
                     clear = true;
                     ui.close();
                 }
@@ -484,7 +517,12 @@ impl Studio {
             self.open_workspace(path);
         }
         if clear {
-            self.config.projects.clear();
+            let old = std::mem::take(&mut self.config.projects);
+            self.undo_toast(
+                "Cleared recent projects",
+                Box::new(move |studio: &mut Studio| studio.config.projects = old),
+                Box::new(|| {}),
+            );
         }
         // Flat rows (root files, then folders with their files when expanded), virtualized.
         let mut rows = vec![];
@@ -587,7 +625,9 @@ impl Studio {
                 ui.horizontal(|ui| {
                     Self::eyebrow(ui, "SOURCES");
                     if let Some(m) = selected {
-                        ui.label(RichText::new(&m.role).size(10.5).color(p.accent));
+                        if !m.role.is_empty() {
+                            ui.label(RichText::new(&m.role).size(10.5).color(p.accent));
+                        }
                         clear = ui.small_button("Latest").clicked();
                     }
                 });
@@ -610,7 +650,7 @@ impl Studio {
                             ui.hyperlink_to("Open", &source.path);
                         }
                         ui.label(RichText::new(&source.text).size(12.0));
-                        if ui.small_button("Copy").clicked() {
+                        if ui.small_button(icons::label(icons::COPY, "Copy")).clicked() {
                             ui.ctx().copy_text(source.text.clone());
                         }
                     });
@@ -635,10 +675,10 @@ impl Studio {
         let mut entered_code = false;
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(idle, |ui| {
-                ui.selectable_value(&mut self.coding, false, "Chat");
+                ui.selectable_value(&mut self.coding, false, icons::label(icons::CHAT, "Chat"));
                 // Chat replies no longer re-list the workspace, so catch up on entering Code.
                 entered_code = ui
-                    .selectable_value(&mut self.coding, true, "Code")
+                    .selectable_value(&mut self.coding, true, icons::label(icons::EDITOR, "Code"))
                     .changed();
                 ui.separator();
                 egui::ComboBox::from_id_salt("model")
@@ -647,7 +687,7 @@ impl Studio {
                     } else {
                         &self.config.model
                     })
-                    .width(170.0)
+                    .width(150.0)
                     .show_ui(ui, |ui| {
                         for model in &self.models {
                             ui.selectable_value(&mut self.config.model, model.clone(), model);
@@ -656,24 +696,39 @@ impl Studio {
                     .response
                     .on_hover_text("Model");
                 if !self.config.personas.is_empty() {
-                    let name = self
-                        .config
-                        .personas
-                        .get(self.active_persona)
-                        .map(|p| p.name.as_str())
-                        .unwrap_or("Assistant");
+                    let name = if self.config.use_character {
+                        self.config
+                            .personas
+                            .get(self.active_persona)
+                            .map_or("No character", |p| p.name.as_str())
+                    } else {
+                        "No character"
+                    };
                     egui::ComboBox::from_id_salt("character")
                         .selected_text(name)
-                        .width(130.0)
+                        .width(120.0)
                         .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(!self.config.use_character, "No character")
+                                .on_hover_text("Chat as the plain agent")
+                                .clicked()
+                            {
+                                self.config.use_character = false;
+                                // Group chat needs characters.
+                                self.group_chat = false;
+                            }
                             for (i, p) in self.config.personas.iter().enumerate() {
-                                ui.selectable_value(&mut self.active_persona, i, &p.name);
+                                let on = self.config.use_character && self.active_persona == i;
+                                if ui.selectable_label(on, &p.name).clicked() {
+                                    self.active_persona = i;
+                                    self.config.use_character = true;
+                                }
                             }
                         })
                         .response
                         .on_hover_text("Character");
                 }
-                ui.menu_button("Options", |ui| {
+                let options = ui.menu_button(icons::label(icons::SETTINGS, "Options"), |ui| {
                     let docs_toggled = ui
                         .checkbox(&mut self.use_docs, "Use documentation")
                         .changed();
@@ -693,9 +748,16 @@ impl Studio {
                     ui.checkbox(&mut self.use_web, "Web search")
                         .on_hover_text("Sends search queries to DuckDuckGo.");
                     ui.add_enabled(
-                        !self.coding,
+                        !self.coding
+                            && self.config.use_character
+                            && !self.config.personas.is_empty(),
                         egui::Checkbox::new(&mut self.group_chat, "Group chat"),
-                    );
+                    )
+                    .on_disabled_hover_text(if self.coding {
+                        "Group chat is for Chat mode."
+                    } else {
+                        "Choose a character first."
+                    });
                     ui.separator();
                     egui::ComboBox::from_id_salt("pack")
                         .selected_text(if self.pack.is_empty() {
@@ -711,10 +773,16 @@ impl Studio {
                             }
                         });
                 });
+                options
+                    .response
+                    .on_hover_text("Documentation, web search, group chat");
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .selectable_label(self.config.show_inspector, "Context")
+                    .selectable_label(
+                        self.config.show_inspector,
+                        icons::label(icons::EYE, "Context"),
+                    )
                     .on_hover_text("Show sources and activity")
                     .clicked()
                 {
@@ -790,27 +858,30 @@ impl Studio {
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("What are we working on?").size(20.0).strong());
             ui.add_space(10.0);
-            let prompts: &[(&str, &str)] = if self.coding {
-                &[
-                    ("Explore this project", "List the files in this workspace and explain how the project is organized. Read the main files first."),
-                    ("Ask the docs", "Explain Rust ownership and borrowing with a short example. Cite the documentation."),
-                    ("Plan a feature", "Help me plan a new feature. First inspect the workspace, then ask what I want to build."),
-                ]
-            } else {
-                &[
-                    ("Brainstorm", "Help me brainstorm ideas. Ask me a couple of questions first."),
-                    ("Explain a concept", "Explain a concept to me simply, then check my understanding."),
-                ]
-            };
+            // Suggestions are data (assets/prompts/suggestions.json, or the user's copy); they
+            // are re-read every few seconds rather than every frame.
+            let stale = self.suggestions.0 != self.coding
+                || self
+                    .suggestions
+                    .1
+                    .is_none_or(|at| at.elapsed() > Duration::from_secs(5));
+            if stale {
+                let list = prompts::suggestions(self.coding)
+                    .into_iter()
+                    .map(|s| (s.title, s.prompt))
+                    .collect();
+                self.suggestions = (self.coding, Some(Instant::now()), list);
+            }
+            let chips = self.suggestions.2.clone();
             // Measure the chip row so it can be centered as a unit.
             let spacing = ui.spacing().item_spacing.x;
             let pad = ui.spacing().button_padding.x * 2.0;
-            let row: f32 = prompts
+            let row: f32 = chips
                 .iter()
                 .map(|(t, _)| {
                     ui.fonts_mut(|f| {
                         f.layout_no_wrap(
-                            (*t).to_owned(),
+                            t.clone(),
                             egui::TextStyle::Button.resolve(ui.style()),
                             p.text,
                         )
@@ -819,15 +890,20 @@ impl Studio {
                     }) + pad
                 })
                 .sum::<f32>()
-                + spacing * (prompts.len().saturating_sub(1)) as f32;
+                + spacing * (chips.len().saturating_sub(1)) as f32;
             ui.horizontal(|ui| {
                 ui.add_space(((ui.available_width() - row) / 2.0).max(0.0));
-                for (title, prompt) in prompts {
+                for (title, prompt) in &chips {
                     if ui
-                        .add(egui::Button::new(*title).fill(p.card).corner_radius(8))
+                        .add(
+                            egui::Button::new(title.as_str())
+                                .fill(p.card)
+                                .corner_radius(8),
+                        )
+                        .on_hover_text(prompt.as_str())
                         .clicked()
                     {
-                        self.draft = (*prompt).into();
+                        self.draft.clone_from(prompt);
                     }
                 }
             });
@@ -842,15 +918,26 @@ impl Studio {
         let [model_ok, workspace_ok, docs_ok] = self.paths_ok;
         let server_ok = self.server_found.is_some();
         let working = self.llama_busy || self.setup.is_some();
-        let mut rows: Vec<(bool, &str, &str, Fix, bool)> = vec![];
+        // (done, label, button, fix, button enabled, button icon, required)
+        let mut rows: Vec<(bool, &str, &str, Fix, bool, &str, bool)> = vec![];
         if direct {
-            rows.push((model_ok, "Model file", "Choose…", Fix::Model, !working));
+            rows.push((
+                model_ok,
+                "Model file",
+                "Choose…",
+                Fix::Model,
+                !working,
+                icons::OPEN_FOLDER,
+                true,
+            ));
             rows.push((
                 server_ok,
                 "llama-server found",
                 "Choose…",
                 Fix::Server,
                 !working,
+                icons::OPEN_FOLDER,
+                true,
             ));
             rows.push((
                 self.online || self.llama.running(),
@@ -858,6 +945,8 @@ impl Studio {
                 "Start",
                 Fix::Start,
                 model_ok && server_ok && !working,
+                icons::REFRESH,
+                true,
             ));
         } else {
             rows.push((
@@ -866,6 +955,8 @@ impl Studio {
                 "Start",
                 Fix::Ollama,
                 !self.checking,
+                icons::REFRESH,
+                true,
             ));
         }
         rows.push((
@@ -874,14 +965,26 @@ impl Studio {
             "Open…",
             Fix::Workspace,
             self.worker.is_none(),
+            icons::OPEN_FOLDER,
+            true,
         ));
-        rows.push((docs_ok, "Documentation (optional)", "Add…", Fix::Docs, true));
+        rows.push((
+            docs_ok,
+            "Documentation (optional)",
+            "Add…",
+            Fix::Docs,
+            true,
+            icons::LIBRARY,
+            false,
+        ));
         rows.push((
             self.embed_installed(),
             "Embeddings (optional)",
             "Models…",
             Fix::Embeddings,
             true,
+            icons::MODELS,
+            false,
         ));
         let mut fix = None;
         let mut auto = false;
@@ -895,13 +998,20 @@ impl Studio {
                 });
                 ui.add_space(6.0);
                 Self::card(ui, |ui| {
-                    for (ok, label, button, action, enabled) in rows {
+                    for (ok, label, button, action, enabled, icon, required) in rows {
                         ui.horizontal(|ui| {
                             // Fixed-width icon column so labels line up whatever the glyph.
                             ui.add_sized(
                                 [16.0, ui.spacing().interact_size.y],
                                 egui::Label::new(
-                                    RichText::new(if ok { "✔" } else { "–" }).color(if ok {
+                                    RichText::new(if ok {
+                                        icons::CHECK
+                                    } else if required {
+                                        icons::WARNING
+                                    } else {
+                                        "–"
+                                    })
+                                    .color(if ok {
                                         p.ok
                                     } else {
                                         p.muted
@@ -914,7 +1024,10 @@ impl Studio {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if ui
-                                            .add_enabled(enabled, egui::Button::new(button))
+                                            .add_enabled(
+                                                enabled,
+                                                egui::Button::new(icons::label(icon, button)),
+                                            )
                                             .clicked()
                                         {
                                             fix = Some(action);
@@ -936,14 +1049,17 @@ impl Studio {
                     } else if direct && (!model_ok || !server_ok) {
                         ui.separator();
                         let model = self.setup_choice();
-                        auto = Self::primary(ui, "Set up automatically")
-                            .on_hover_text(format!(
-                                "Downloads llama.cpp {} and {} ({:.1} GB).",
-                                setup::LLAMA_TAG,
-                                model.name,
-                                model.size as f64 / 1e9
-                            ))
-                            .clicked();
+                        auto = Self::primary(
+                            ui,
+                            &icons::label(icons::DOWNLOAD, "Set up automatically"),
+                        )
+                        .on_hover_text(format!(
+                            "Downloads llama.cpp {} and {} ({:.1} GB).",
+                            setup::LLAMA_TAG,
+                            model.name,
+                            model.size as f64 / 1e9
+                        ))
+                        .clicked();
                     }
                 });
             });
@@ -1040,18 +1156,38 @@ impl Studio {
                 .show(ui, |ui| {
                     ui.set_min_width(width - 30.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&m.role).size(12.0).strong().color(if mine {
-                            p.accent
-                        } else {
-                            p.muted
-                        }));
+                        // "No character" replies carry no name.
+                        if !m.role.is_empty() {
+                            ui.label(RichText::new(&m.role).size(12.0).strong().color(if mine {
+                                p.accent
+                            } else {
+                                p.muted
+                            }));
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if idle {
-                                ui.menu_button(
-                                    RichText::new("…").size(11.0).color(p.muted),
+                            // Rare actions live in the "…" menu.
+                            let can_speak = !mine && !m.text.is_empty() && !streaming;
+                            if idle || can_speak {
+                                let more = ui.menu_button(
+                                    RichText::new(icons::MORE).size(11.0).color(p.muted),
                                     |ui| {
-                                        if ui
-                                            .button("Fork from here")
+                                        if can_speak {
+                                            let label = if speaking == Some(i) {
+                                                icons::label(icons::STOP, "Stop reading")
+                                            } else {
+                                                icons::label(icons::SPEAK, "Speak")
+                                            };
+                                            if ui
+                                                .button(label)
+                                                .on_hover_text("Read aloud with the system voice")
+                                                .clicked()
+                                            {
+                                                action = Some(MessageAction::Speak(i));
+                                                ui.close();
+                                            }
+                                        }
+                                        if idle && ui
+                                            .button(icons::label(icons::FORK, "Fork from here"))
                                             .on_hover_text(
                                                 "Start a new chat with the messages up to this one",
                                             )
@@ -1062,23 +1198,26 @@ impl Studio {
                                         }
                                     },
                                 );
+                                more.response.on_hover_text("More");
                             }
-                            if !m.text.is_empty() && quiet_button(ui, "Copy").clicked() {
+                            if !m.text.is_empty()
+                                && quiet_button(ui, &icons::label(icons::COPY, "Copy")).clicked()
+                            {
                                 ui.ctx().copy_text(m.text.clone());
                             }
-                            if !mine && !m.text.is_empty() && !streaming {
-                                let label = if speaking == Some(i) { "Stop" } else { "Speak" };
-                                if quiet_button(ui, label)
-                                    .on_hover_text("Read aloud with the system voice")
-                                    .clicked()
-                                {
-                                    action = Some(MessageAction::Speak(i));
-                                }
-                            }
-                            if idle && mine && !editing && quiet_button(ui, "Edit").clicked() {
+                            if idle
+                                && mine
+                                && !editing
+                                && quiet_button(ui, &icons::label(icons::EDIT, "Edit")).clicked()
+                            {
                                 action = Some(MessageAction::Edit(i));
                             }
-                            if idle && !mine && last && quiet_button(ui, "Regenerate").clicked() {
+                            if idle
+                                && !mine
+                                && last
+                                && quiet_button(ui, &icons::label(icons::REGENERATE, "Regenerate"))
+                                    .clicked()
+                            {
                                 action = Some(MessageAction::Regenerate);
                             }
                             if can_continue
@@ -1102,7 +1241,7 @@ impl Studio {
                     });
                     if !m.images.is_empty() {
                         ui.label(
-                            RichText::new(format!("🖼 {}", m.images.join(", ")))
+                            RichText::new(icons::label(icons::ATTACH, &m.images.join(", ")))
                                 .size(11.5)
                                 .color(p.muted),
                         );
@@ -1114,7 +1253,7 @@ impl Studio {
                                 .desired_width(f32::INFINITY),
                         );
                         ui.horizontal(|ui| {
-                            if Self::primary(ui, "Send").clicked() {
+                            if Self::primary(ui, &icons::label(icons::SEND, "Send")).clicked() {
                                 action = Some(MessageAction::Resend(i));
                             }
                             if ui.button("Cancel").clicked() {
@@ -1230,9 +1369,14 @@ impl Studio {
                         .inner_margin(egui::Margin::symmetric(6, 2))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("🖼 {}", a.name)).size(11.5))
-                                    .on_hover_text(format!("{} KB", a.bytes.len() / 1024));
-                                if quiet_button(ui, "×").on_hover_text("Remove").clicked() {
+                                ui.label(
+                                    RichText::new(icons::label(icons::ATTACH, &a.name)).size(11.5),
+                                )
+                                .on_hover_text(format!("{} KB", a.bytes.len() / 1024));
+                                if quiet_button(ui, icons::CLOSE)
+                                    .on_hover_text("Remove")
+                                    .clicked()
+                                {
                                     remove = Some(n);
                                 }
                             });
@@ -1265,22 +1409,39 @@ impl Studio {
         ui.horizontal(|ui| {
             let no_vision = self.images_blocked();
             attach = ui
-                .add_enabled(idle && !no_vision, egui::Button::new("📎").frame(false))
+                .add_enabled(idle && !no_vision, egui::Button::new(icons::ATTACH).frame(false))
                 .on_hover_text(
                     "Attach images (PNG, JPEG, WebP) for a vision model, or audio to transcribe into the message. Images can also be dropped or pasted as files.",
                 )
                 .on_disabled_hover_text(if no_vision { NO_VISION } else { "Wait for the reply." })
                 .clicked();
-            ui.add(
-                egui::Label::new(RichText::new(&self.status).size(11.0).color(p.muted)).truncate(),
-            );
+            // The empty reply bubble already shows the status while it waits.
+            let waiting = !idle
+                && self
+                    .conversation
+                    .messages
+                    .last()
+                    .is_some_and(|m| m.text.is_empty());
+            if !waiting {
+                ui.add(
+                    egui::Label::new(RichText::new(&self.status).size(11.0).color(p.muted))
+                        .truncate(),
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !idle {
-                    stop = ui.button("Stop").on_hover_text("Esc").clicked();
+                    stop = ui
+                        .button(icons::label(icons::STOP, "Stop"))
+                        .on_hover_text("Esc")
+                        .clicked();
                 } else {
                     let blocked = self.send_blocked();
                     let button =
-                        egui::Button::new(RichText::new("Send").color(p.on_accent).strong())
+                        egui::Button::new(
+                            RichText::new(icons::label(icons::SEND, "Send"))
+                                .color(p.on_accent)
+                                .strong(),
+                        )
                             .fill(p.accent)
                             .corner_radius(8);
                     send |= ui
@@ -1326,7 +1487,7 @@ impl Studio {
             || self.setup.is_some()
             || self.any_bot_running();
         Self::card(ui, |ui| {
-            Self::eyebrow(ui, "MODEL PROVIDER");
+            Self::eyebrow(ui, &icons::label(icons::MODELS, "MODEL PROVIDER"));
             ui.add_enabled_ui(!locked, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.config.direct_backend, true, "llama.cpp");
@@ -1351,7 +1512,10 @@ impl Studio {
             });
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.checking, egui::Button::new("Check connection"))
+                    .add_enabled(
+                        !self.checking,
+                        egui::Button::new(icons::label(icons::REFRESH, "Check connection")),
+                    )
                     .clicked()
                 {
                     self.check();
@@ -1395,7 +1559,7 @@ impl Studio {
         });
         ui.add_space(12.0);
         Self::card(ui, |ui| {
-            Self::eyebrow(ui, "GENERATION");
+            Self::eyebrow(ui, &icons::label(icons::SETTINGS, "GENERATION"));
             ui.add_enabled_ui(self.worker.is_none(), |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.config.context_tokens, 1024..=32768)
@@ -1428,8 +1592,10 @@ impl Studio {
             self.embedding_settings(ui);
         });
         ui.add_space(12.0);
+        self.agent_settings(ui);
+        ui.add_space(12.0);
         Self::card(ui, |ui| {
-            Self::eyebrow(ui, "INTERFACE");
+            Self::eyebrow(ui, &icons::label(icons::EYE, "INTERFACE"));
             ui.horizontal(|ui| {
                 ui.label("Theme");
                 for (value, label) in [("dark", "Dark"), ("light", "Light"), ("system", "System")] {
@@ -1481,12 +1647,15 @@ impl Studio {
         self.updates_card(ui);
         ui.add_space(12.0);
         Self::card(ui, |ui| {
-            Self::eyebrow(ui, "PROJECT & DATA");
+            Self::eyebrow(ui, &icons::label(icons::OPEN_FOLDER, "PROJECT & DATA"));
             ui.horizontal_wrapped(|ui| {
                 ui.label(self.config.workspace.display().to_string())
                     .on_hover_text("File tools are limited to this folder. Approved commands run as your account.");
                 if ui
-                    .add_enabled(self.worker.is_none(), egui::Button::new("Change…"))
+                    .add_enabled(
+                        self.worker.is_none(),
+                        egui::Button::new(icons::label(icons::OPEN_FOLDER, "Change…")),
+                    )
                     .clicked()
                 {
                     self.choose_workspace();
@@ -1500,11 +1669,16 @@ impl Studio {
             )
             .on_hover_text("Settings, conversations, search index and file backups.");
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Save settings").clicked() {
+                if ui
+                    .button(icons::label(icons::SAVE, "Save settings"))
+                    .clicked()
+                {
                     self.persist();
-                    self.status = "Settings saved".into();
+                    self.toast("Settings saved");
                 }
-                if ui.button("Export conversation…").clicked()
+                if ui
+                    .button(icons::label(icons::EXPORT, "Export conversation…"))
+                    .clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .set_file_name("conversation.json")
                         .save_file()
@@ -1515,14 +1689,14 @@ impl Studio {
                             std::fs::write(path, bytes)?;
                             Ok(())
                         }) {
-                        Ok(()) => self.status = "Conversation exported".into(),
+                        Ok(()) => self.toast("Conversation exported"),
                         Err(e) => self.error = Some(e.to_string()),
                     }
                 }
                 if ui
                     .add_enabled(
                         !self.conversation.messages.is_empty(),
-                        egui::Button::new("Export as Markdown…"),
+                        egui::Button::new(icons::label(icons::EXPORT, "Export as Markdown…")),
                     )
                     .clicked()
                 {
@@ -1530,17 +1704,17 @@ impl Studio {
                     self.export_markdown(&id);
                 }
                 if ui
-                    .button("Copy diagnostics")
+                    .button(icons::label(icons::COPY, "Copy diagnostics"))
                     .on_hover_text(
                         "Versions, paths and recent log lines, for a bug report. Nothing is sent.",
                     )
                     .clicked()
                 {
                     ui.ctx().copy_text(diagnostics::report());
-                    self.status = "Diagnostics copied".into();
+                    self.toast("Diagnostics copied");
                 }
                 if ui
-                    .button("Open logs")
+                    .button(icons::label(icons::OPEN_FOLDER, "Open logs"))
                     .on_hover_text("crash.log and llama-server logs")
                     .clicked()
                     && let Err(e) = diagnostics::open_logs_folder()
@@ -1636,7 +1810,7 @@ impl Studio {
     fn privacy_settings(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui.ctx());
         Self::card(ui, |ui| {
-            Self::eyebrow(ui, "NETWORK & PRIVACY");
+            Self::eyebrow(ui, &icons::label(icons::CONNECTIONS, "NETWORK & PRIVACY"));
             ui.checkbox(&mut self.config.confirm_web_query, "Review web searches before sending")
                 .on_hover_text("With Web search on, the automatic first query is shown for approval before it goes to DuckDuckGo.");
             let locked = self.worker.is_some() || self.llama.running();
@@ -1694,7 +1868,7 @@ impl Studio {
         let (mut test, mut remove) = (None, None);
         Self::card(ui, |ui| {
             ui.horizontal(|ui| {
-                Self::eyebrow(ui, "MCP SERVERS");
+                Self::eyebrow(ui, &icons::label(icons::CONNECTIONS, "MCP SERVERS"));
                 ui.label(RichText::new("ⓘ").size(11.0).color(p.muted)).on_hover_text(
                     "Tools from enabled servers are offered in Code mode as mcp__server__tool. Every call needs your approval. Servers run as your account.",
                 );
@@ -1723,7 +1897,11 @@ impl Studio {
                             {
                                 test = Some(i);
                             }
-                            if ui.small_button("Remove").clicked() {
+                            if ui
+                                .small_button(icons::TRASH)
+                                .on_hover_text("Remove (Undo is offered)")
+                                .clicked()
+                            {
                                 remove = Some(i);
                             }
                         });
@@ -1752,7 +1930,7 @@ impl Studio {
                     });
                     ui.add_space(4.0);
                 }
-                if ui.button("Add server").clicked() {
+                if ui.button(icons::label(icons::PLUS, "Add server")).clicked() {
                     let taken: Vec<&str> = self
                         .config
                         .mcp_servers
@@ -1772,8 +1950,19 @@ impl Studio {
             });
         });
         if let Some(i) = remove {
-            self.config.mcp_servers.remove(i);
+            let server = self.config.mcp_servers.remove(i);
             self.mcp_args.remove(i);
+            let name = server.name.clone();
+            self.undo_toast(
+                format!("Removed MCP server {name}"),
+                Box::new(move |studio: &mut Studio| {
+                    let at = i.min(studio.config.mcp_servers.len());
+                    studio.config.mcp_servers.insert(at, server);
+                    // The argument boxes are rebuilt from the servers.
+                    studio.mcp_args.clear();
+                }),
+                Box::new(|| {}),
+            );
         }
         if let Some(i) = test {
             self.test_mcp(i);
@@ -1818,13 +2007,13 @@ impl Studio {
     fn updates_card(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui.ctx());
         Self::card(ui, |ui| {
-            Self::eyebrow(ui, "UPDATES");
+            Self::eyebrow(ui, &icons::label(icons::DOWNLOAD, "UPDATES"));
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).strong());
                 if ui
                     .add_enabled(
                         !self.update_checking,
-                        egui::Button::new("Check for updates"),
+                        egui::Button::new(icons::label(icons::REFRESH, "Check for updates")),
                     )
                     .clicked()
                 {
@@ -1847,6 +2036,32 @@ impl Studio {
                 {
                     self.install_update();
                 }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Channel");
+                ui.add_enabled_ui(self.update_progress.is_none(), |ui| {
+                    for (value, label, hint) in [
+                        ("stable", "Stable", "Tagged releases."),
+                        (
+                            "nightly",
+                            "Nightly",
+                            "Built from every push to main. Newer, but less tested.",
+                        ),
+                    ] {
+                        if ui
+                            .selectable_label(self.config.update_channel == value, label)
+                            .on_hover_text(hint)
+                            .clicked()
+                            && self.config.update_channel != value
+                        {
+                            self.config.update_channel = value.into();
+                            // A release found on the other channel no longer applies.
+                            self.update = None;
+                            self.update_hidden = false;
+                            self.update_status.clear();
+                        }
+                    }
+                });
             });
             ui.checkbox(&mut self.config.auto_update, "Check for updates at launch")
                 .on_hover_text(format!(

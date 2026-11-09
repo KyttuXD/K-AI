@@ -1,5 +1,5 @@
 //! Self-update from the GitHub releases of KyttuXD/Kyttu-AI: look up the latest
-//! stable release, download this platform's zip into `data_dir()/updates/<tag>/`
+//! stable release (or, on the nightly channel, the rolling "nightly" pre-release), download this platform's zip into `data_dir()/updates/<tag>/`
 //! (resumable), check it against the release's SHA256SUMS.txt with the system
 //! hash tool, unpack it with the system tar/unzip, then swap it in for the
 //! running app and start the new one. Debug builds and copies running from a
@@ -23,6 +23,12 @@ use std::{
 
 pub const REPO: &str = "KyttuXD/Kyttu-AI";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The commit this build was made from (build.rs); empty when it could not be found.
+const COMMIT: &str = match option_env!("KYTTU_COMMIT") {
+    Some(c) => c,
+    None => "",
+};
+const NIGHTLY_TAG: &str = "nightly";
 const SUMS: &str = "SHA256SUMS.txt";
 const UNPACKED: &str = "unpacked";
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,6 +42,21 @@ pub struct Release {
     pub asset_name: String,
     pub size: u64,
     pub sums_url: Option<String>,
+    /// The rolling nightly pre-release rather than a stable version.
+    pub nightly: bool,
+    /// Nightly only: the full commit the release was built from.
+    pub commit: Option<String>,
+}
+
+impl Release {
+    /// The folder name under `updates_dir()`: the tag, or `nightly-<commit>` so a new
+    /// nightly never reuses an older download.
+    fn stage_name(&self) -> String {
+        match (&self.commit, self.nightly) {
+            (Some(c), true) => format!("{NIGHTLY_TAG}-{}", &c[..c.len().min(12)]),
+            _ => self.tag.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -182,6 +203,55 @@ fn parse_release(v: &Value, current: &str, artifact: &str) -> Result<Option<Rele
         asset_name,
         size: asset["size"].as_u64().unwrap_or(0),
         sums_url: assets.iter().find(|a| a["name"] == SUMS).and_then(url),
+        nightly: false,
+        commit: None,
+    }))
+}
+
+/// A full 40-digit commit id, lower-cased.
+fn parse_commit(text: &str) -> Option<String> {
+    let t = text.trim();
+    (t.len() == 40 && t.bytes().all(|b| b.is_ascii_hexdigit())).then(|| t.to_ascii_lowercase())
+}
+
+/// The nightly release in GitHub's JSON when its commit (the body's first line,
+/// `commit: <sha>`) differs from `current` and it has a download for `artifact`.
+/// An empty `current` (a build that does not know its commit) never updates.
+fn parse_nightly(v: &Value, current: &str, artifact: &str) -> Result<Option<Release>> {
+    if v["draft"].as_bool().unwrap_or(false) {
+        return Ok(None);
+    }
+    let body = v["body"].as_str().unwrap_or_default().replace("\r\n", "\n");
+    let (first, notes) = body.split_once('\n').unwrap_or((body.as_str(), ""));
+    let commit = first
+        .trim()
+        .strip_prefix("commit:")
+        .and_then(parse_commit)
+        .context("The nightly release does not say which commit it was built from")?;
+    let current = current.trim();
+    if current.is_empty() || commit.eq_ignore_ascii_case(current) {
+        return Ok(None);
+    }
+    let assets = v["assets"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let exact = format!("kyttu-ai-{NIGHTLY_TAG}-{artifact}.zip");
+    let asset = assets
+        .iter()
+        .find(|a| a["name"] == exact.as_str())
+        .with_context(|| format!("The nightly release has no download for {artifact} yet"))?;
+    let url = |a: &Value| a["browser_download_url"].as_str().map(String::from);
+    Ok(Some(Release {
+        tag: NIGHTLY_TAG.into(),
+        version: format!("nightly-{}", &commit[..7]),
+        notes: notes.trim().to_string(),
+        asset_url: url(asset).context("The release asset has no download URL")?,
+        asset_name: exact,
+        size: asset["size"].as_u64().unwrap_or(0),
+        sums_url: assets.iter().find(|a| a["name"] == SUMS).and_then(url),
+        nightly: true,
+        commit: Some(commit),
     }))
 }
 
@@ -200,12 +270,11 @@ fn client(timeout: Option<Duration>) -> Result<reqwest::blocking::Client> {
     })
 }
 
-/// The latest stable release when it is newer than this build.
-pub fn check() -> Result<Option<Release>> {
-    let artifact = this_artifact().context("Updates are not published for this platform")?;
+/// GET `path` under the repo's releases API; None when GitHub has no such release.
+fn fetch_release(path: &str) -> Result<Option<Value>> {
     let response = client(Some(TIMEOUT))?
         .get(format!(
-            "https://api.github.com/repos/{REPO}/releases/latest"
+            "https://api.github.com/repos/{REPO}/releases/{path}"
         ))
         .header(ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -219,7 +288,20 @@ pub fn check() -> Result<Option<Release>> {
         "GitHub answered {}",
         response.status()
     );
-    parse_release(&response.json::<Value>()?, VERSION, artifact)
+    Ok(Some(response.json::<Value>()?))
+}
+
+/// The newer release on `channel` ("stable", or "nightly"; anything else counts as
+/// stable): the latest stable release when it is newer than this build, or the
+/// rolling nightly pre-release when it was built from another commit.
+pub fn check(channel: &str) -> Result<Option<Release>> {
+    let artifact = this_artifact().context("Updates are not published for this platform")?;
+    if channel.trim().eq_ignore_ascii_case("nightly") {
+        let release = fetch_release(&format!("tags/{NIGHTLY_TAG}"))?;
+        return release.map_or(Ok(None), |v| parse_nightly(&v, COMMIT, artifact));
+    }
+    let release = fetch_release("latest")?;
+    release.map_or(Ok(None), |v| parse_release(&v, VERSION, artifact))
 }
 
 // ---- dev builds ----------------------------------------------------------------------------------
@@ -290,13 +372,15 @@ fn stage(release: &Release, progress: &Mutex<UpdateProgress>) -> Result<PathBuf>
         bail!(why);
     }
     ensure!(
-        safe_name(&release.tag) && safe_name(&release.asset_name),
+        safe_name(&release.tag)
+            && safe_name(&release.asset_name)
+            && safe_name(&release.stage_name()),
         "The release names are not plain file names"
     );
     let sums_url = release.sums_url.as_deref().context(
         "This release has no SHA256SUMS.txt, so the download cannot be verified; not installing it",
     )?;
-    let dir = updates_dir().join(&release.tag);
+    let dir = updates_dir().join(release.stage_name());
     fs::create_dir_all(&dir)?;
     set(progress, "Fetching checksums", 0, release.size);
     let sums = client(Some(TIMEOUT))?
@@ -949,6 +1033,110 @@ mod tests {
         let mut v = release_json("v0.3.0");
         v["tag_name"] = json!("../evil");
         assert!(parse_release(&v, "0.2.0", "linux-x64").is_err());
+    }
+
+    const SHA_A: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SHA_B: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    fn nightly_json(body: &str) -> Value {
+        let asset = |name: &str, size: u64| json!({"name": name, "size": size, "browser_download_url": format!("https://example.invalid/{name}")});
+        json!({
+            "tag_name": "nightly", "draft": false, "prerelease": true, "body": body,
+            "assets": [
+                asset("kyttu-ai-nightly-linux-x64.zip", 7),
+                asset("kyttu-ai-nightly-windows-x64.zip", 8),
+                asset(SUMS, 4),
+            ]
+        })
+    }
+
+    #[test]
+    fn reads_the_nightly_release() {
+        let body = format!(
+            "commit: {SHA_A}\n\nRebuilt on every push to main.\nFiles are replaced in place."
+        );
+        let r = parse_nightly(&nightly_json(&body), SHA_B, "linux-x64")
+            .unwrap()
+            .unwrap();
+        assert!(r.nightly);
+        assert_eq!(r.commit.as_deref(), Some(SHA_A));
+        assert_eq!(
+            (r.tag.as_str(), r.version.as_str(), r.size),
+            ("nightly", "nightly-0123456", 7)
+        );
+        assert_eq!(r.asset_name, "kyttu-ai-nightly-linux-x64.zip");
+        assert_eq!(
+            r.sums_url.as_deref(),
+            Some("https://example.invalid/SHA256SUMS.txt")
+        );
+        assert_eq!(r.stage_name(), "nightly-0123456789ab");
+        assert_eq!(
+            r.notes,
+            "Rebuilt on every push to main.\nFiles are replaced in place."
+        );
+        let win = parse_nightly(&nightly_json(&body), SHA_B, "windows-x64")
+            .unwrap()
+            .unwrap();
+        assert_eq!(win.asset_name, "kyttu-ai-nightly-windows-x64.zip");
+        // No download for this platform yet.
+        assert!(parse_nightly(&nightly_json(&body), SHA_B, "macos-arm64").is_err());
+    }
+
+    #[test]
+    fn nightly_compares_commits() {
+        let body = format!("commit: {SHA_A}\r\n\r\nnotes");
+        let up_to_date = |current: &str| {
+            parse_nightly(&nightly_json(&body), current, "linux-x64")
+                .unwrap()
+                .is_none()
+        };
+        // Same commit (any case): up to date.
+        assert!(up_to_date(SHA_A));
+        assert!(up_to_date(&SHA_A.to_uppercase()));
+        // A build that does not know its commit never updates.
+        assert!(up_to_date("") && up_to_date("  "));
+        // A different commit is newer.
+        assert!(!up_to_date(SHA_B));
+        // Drafts are ignored; a body without a commit first line is an error.
+        let mut draft = nightly_json(&body);
+        draft["draft"] = json!(true);
+        assert!(parse_nightly(&draft, SHA_B, "linux-x64").unwrap().is_none());
+        let late = format!("notes\ncommit: {SHA_A}");
+        for bad in [
+            "",
+            "no commit here",
+            "commit: abc",
+            "commit: ../../etc/passwd",
+            late.as_str(),
+        ] {
+            assert!(
+                parse_nightly(&nightly_json(bad), SHA_B, "linux-x64").is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nightly_asset_is_exact_and_stable_ignores_nightly() {
+        let body = format!("commit: {SHA_A}");
+        let mut v = nightly_json(&body);
+        v["assets"] = json!([{"name": "kyttu-ai-v9.9.9-linux-x64.zip", "size": 1, "browser_download_url": "https://example.invalid/x.zip"}]);
+        assert!(parse_nightly(&v, SHA_B, "linux-x64").is_err());
+        // The stable path skips the pre-release, and a non-version tag.
+        assert!(
+            parse_release(&nightly_json(&body), "0.2.0", "linux-x64")
+                .unwrap()
+                .is_none()
+        );
+        let mut tagged = nightly_json(&body);
+        tagged["prerelease"] = json!(false);
+        assert!(
+            parse_release(&tagged, "0.2.0", "linux-x64")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(parse_commit(&format!(" {SHA_A}\n")).as_deref(), Some(SHA_A));
+        assert_eq!(parse_commit("zzzz"), None);
     }
 
     #[test]

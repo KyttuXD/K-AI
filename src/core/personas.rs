@@ -24,6 +24,7 @@ pub struct LoreEntry {
     pub text: String,
 }
 
+/// A character. An empty `name` means "no character" (`Persona::default()`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Persona {
@@ -43,9 +44,9 @@ pub struct Persona {
 impl Default for Persona {
     fn default() -> Self {
         Self {
-            name: "Assistant".into(),
-            instructions: "A thoughtful, practical coding partner. Explain decisions clearly."
-                .into(),
+            // An empty name means "no character": the plain agent.
+            name: String::new(),
+            instructions: String::new(),
             avatar_url: String::new(),
             model: String::new(),
             in_group: true,
@@ -54,6 +55,13 @@ impl Default for Persona {
             memory: vec![],
             turn_order: 0,
         }
+    }
+}
+
+impl Persona {
+    /// True for a real character (non-empty name); false for the plain agent.
+    pub fn is_character(&self) -> bool {
+        !self.name.trim().is_empty()
     }
 }
 
@@ -232,6 +240,7 @@ mod tests {
     #[test]
     fn validates_lore_and_notes() {
         let mut p = Persona {
+            name: "Ada".into(),
             lorebook: vec![lore(&["k"], &"x".repeat(MAX_LORE_TEXT + 1))],
             ..Default::default()
         };

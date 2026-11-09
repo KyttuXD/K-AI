@@ -95,8 +95,16 @@ pub struct Config {
     /// Extra environment variable names approved commands may see, per workspace path.
     pub workspace_env: BTreeMap<String, Vec<String>>,
     pub confirm_web_query: bool,
+    /// Chat as the selected character; off = the plain agent ("No character").
+    pub use_character: bool,
+    /// Core rules (SOUL) are added to the prompt.
+    pub soul_enabled: bool,
+    /// SOUL also applies while no character is selected.
+    pub soul_when_no_character: bool,
+    /// "stable" or "nightly".
+    pub update_channel: String,
 }
-const SETTINGS_VERSION: u32 = 4;
+const SETTINGS_VERSION: u32 = 5;
 pub const DEFAULT_ACCENT: [u8; 3] = [247, 87, 108];
 pub const MAX_PROJECTS: usize = 12;
 pub fn data_dir() -> PathBuf {
@@ -172,6 +180,10 @@ impl Default for Config {
             tts: false,
             workspace_env: BTreeMap::new(),
             confirm_web_query: true,
+            use_character: false,
+            soul_enabled: true,
+            soul_when_no_character: false,
+            update_channel: "stable".into(),
         }
     }
 }
@@ -213,6 +225,14 @@ impl Config {
                 self.doc_sources = crate::knowledge::docs::migrate_docs_dir(&self.docs);
             }
             self.pack.clear();
+        }
+        if self.settings_version < 5 {
+            // v5: "No character" exists; old installs always chatted as a character.
+            self.use_character = !self.personas.is_empty();
+            // Characters saved before the Available-on-Discord switch worked on Discord.
+            for persona in &mut self.personas {
+                persona.discord = true;
+            }
         }
         self.settings_version = SETTINGS_VERSION;
         self
@@ -417,7 +437,7 @@ mod tests {
         let json = serde_json::json!({"settings_version":3,"docs":docs,"pack":"rust"});
         let old: Config = serde_json::from_value(json).unwrap();
         let migrated = old.migrate();
-        assert_eq!(migrated.settings_version, 4);
+        assert_eq!(migrated.settings_version, SETTINGS_VERSION);
         assert_eq!(migrated.doc_sources.len(), 1);
         let source = &migrated.doc_sources[0];
         assert_eq!(source.name, "MyDocs");
@@ -491,6 +511,28 @@ mod tests {
         assert!(old.window_size.is_none());
         assert!(old.confirm_web_query && old.mcp_servers.is_empty());
         assert!(!old.rerank_user_set);
+    }
+    #[test]
+    fn v5_migration_keeps_characters_on_and_enables_discord() {
+        let old: Config = serde_json::from_str(
+            r#"{"settings_version":4,"personas":[{"name":"A"},{"name":"B","discord":false}]}"#,
+        )
+        .unwrap();
+        let migrated = old.migrate();
+        assert!(migrated.use_character);
+        assert!(migrated.personas.iter().all(|p| p.discord));
+        assert!(migrated.soul_enabled && !migrated.soul_when_no_character);
+        assert_eq!(migrated.update_channel, "stable");
+        // No characters: the plain agent stays selected.
+        let empty: Config = serde_json::from_str(r#"{"settings_version":4}"#).unwrap();
+        assert!(!empty.migrate().use_character);
+        // v5 files are left alone.
+        let current: Config = serde_json::from_str(
+            r#"{"settings_version":5,"personas":[{"name":"A","discord":false}]}"#,
+        )
+        .unwrap();
+        let current = current.migrate();
+        assert!(!current.use_character && !current.personas[0].discord);
     }
     #[test]
     fn rerank_auto_enables_only_when_useful_and_unset() {

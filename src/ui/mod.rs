@@ -1,10 +1,13 @@
+mod agent;
 mod features;
+mod icons;
 mod library;
 mod models;
+mod notice;
 mod views;
 mod workbench;
 use crate::core::personas::Persona;
-use crate::core::{diagnostics, llama, setup, update};
+use crate::core::{diagnostics, llama, prompts, setup, trash, update};
 use crate::{
     config::{self, Config, data_dir},
     docs::{Library, Source},
@@ -372,7 +375,7 @@ enum SystemEvent {
     Embeddings(Vec<String>),
     Llama(Result<u16, String>),
     Setup(Result<setup::SetupResult, String>),
-    UpdateChecked(Result<Option<update::Release>, String>, bool),
+    UpdateChecked(String, Result<Option<update::Release>, String>, bool),
     UpdateStaged(Result<PathBuf, String>),
     ServerVersion(PathBuf, Option<String>),
     /// Workspace listing for the given workspace, and the same files grouped by folder
@@ -441,11 +444,6 @@ struct SetupJob {
     progress: Arc<Mutex<setup::SetupProgress>>,
     cancel: Arc<AtomicBool>,
 }
-/// A dismissible notice with an optional Undo for a deleted conversation.
-struct Undo {
-    text: String,
-    conversation: Option<Conversation>,
-}
 
 pub struct Studio {
     config: Config,
@@ -462,7 +460,12 @@ pub struct Studio {
     conversations: Vec<ConvMeta>,
     conversation_search: String,
     renaming: Option<(String, String)>,
-    undo: Option<Undo>,
+    /// Toasts, undo toasts and their pending "really delete" closures (ui/notice.rs).
+    notices: notice::Notices,
+    /// Settings → Agent state (ui/agent.rs).
+    agent: agent::AgentState,
+    /// Empty-chat suggestions as (title, prompt) for the Code flag, and when they were read.
+    suggestions: (bool, Option<Instant>, Vec<(String, String)>),
     models: Vec<String>,
     connection: String,
     online: bool,
@@ -729,7 +732,11 @@ fn fork_point(messages: &[Message], index: usize) -> (usize, usize) {
 fn to_markdown(title: &str, messages: &[Message]) -> String {
     let mut out = format!("# {title}\n\n");
     for m in messages {
-        out.push_str(&format!("**{}**\n\n{}\n\n", m.role, m.text.trim_end()));
+        // A reply without a character has no name to print.
+        if !m.role.is_empty() {
+            out.push_str(&format!("**{}**\n\n", m.role));
+        }
+        out.push_str(&format!("{}\n\n", m.text.trim_end()));
     }
     out
 }
@@ -1131,6 +1138,7 @@ impl Studio {
     pub fn new(cc: &eframe::CreationContext<'_>, config: Config, notice: Option<String>) -> Self {
         let ctx = &cc.egui_ctx;
         install_fonts(ctx);
+        icons::install(ctx);
         apply_style(ctx, config.accent, config.compact);
         ctx.set_theme(theme_preference(&config.theme));
         ctx.all_styles_mut(|s| {
@@ -1184,7 +1192,9 @@ impl Studio {
             conversations,
             conversation_search: String::new(),
             renaming: None,
-            undo: None,
+            notices: Default::default(),
+            agent: Default::default(),
+            suggestions: (false, None, vec![]),
             models: vec![],
             connection: "Checking…".into(),
             online: false,
@@ -1553,7 +1563,7 @@ impl Studio {
             self.draft = text;
         }
         self.persist();
-        self.status = "Forked into a new chat".into();
+        self.toast("Forked into a new chat");
     }
     fn toggle_pin(&mut self, id: &str) {
         let pins = &mut self.config.pinned_conversations;
@@ -1581,7 +1591,7 @@ impl Studio {
             return;
         };
         match std::fs::write(&path, to_markdown(&title, &c.messages)) {
-            Ok(()) => self.status = format!("Exported to {}", path.display()),
+            Ok(()) => self.toast(format!("Exported to {}", path.display())),
             Err(e) => self.error = Some(format!("Could not export: {e}")),
         }
     }
@@ -1614,7 +1624,8 @@ impl Studio {
             Err(e) => self.error = Some(format!("Could not rename: {e}")),
         }
     }
-    /// Deletes a conversation, keeping a copy in conversation.prev.json for Undo.
+    /// Deletes a conversation at once: its files go to the trash and an undo toast offers
+    /// to bring them back; they are really deleted when the toast expires or the app exits.
     fn delete_conversation(&mut self, id: &str) {
         if self.worker.is_some() {
             return;
@@ -1622,46 +1633,122 @@ impl Studio {
         let Some(path) = conversation_path(id) else {
             return;
         };
+        let was_open = id == self.conversation.id;
+        if was_open {
+            self.persist();
+        }
         self.flush_writes();
-        let removed = if id == self.conversation.id {
-            let c = std::mem::take(&mut self.conversation);
+        let mut backup = path.clone().into_os_string();
+        backup.push(".bak");
+        let mut staged = vec![];
+        for file in [path, PathBuf::from(backup)] {
+            if !file.is_file() {
+                continue;
+            }
+            match trash::stage(&file) {
+                Ok(item) => staged.push(item),
+                Err(e) => {
+                    for item in staged {
+                        let _ = item.restore();
+                    }
+                    self.error = Some(format!("Could not delete the chat: {e:#}"));
+                    return;
+                }
+            }
+        }
+        let title: String = self
+            .conversations
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.title.chars().take(40).collect())
+            .unwrap_or_default();
+        let pin = self
+            .config
+            .pinned_conversations
+            .iter()
+            .position(|p| p == id);
+        if was_open {
+            self.conversation = Conversation::default();
             self.config.active_conversation.clear();
             self.reset_chat_state();
-            Some(c)
-        } else {
-            config::read_json::<Conversation>(&path).0
-        };
-        if let Some(c) = &removed {
-            let _ = config::save_json_compact(&data_dir().join("conversation.prev.json"), c);
         }
-        let _ = std::fs::remove_file(&path);
-        let mut bak = path.into_os_string();
-        bak.push(".bak");
-        let _ = std::fs::remove_file(bak);
         self.conversations.retain(|m| m.id != id);
         self.config.pinned_conversations.retain(|p| p != id);
         self.save_index();
-        self.undo = Some(Undo {
-            text: "Chat deleted".into(),
-            conversation: removed,
-        });
         self.persist();
-    }
-    fn undo_delete(&mut self) {
-        if self.worker.is_some() {
-            return;
-        }
-        let Some(Undo {
-            conversation: Some(c),
-            ..
-        }) = self.undo.take()
-        else {
-            return;
+        let id = id.to_owned();
+        let text = if title.is_empty() {
+            "Chat deleted".to_owned()
+        } else {
+            format!("Deleted \"{title}\"")
         };
-        self.persist();
-        self.conversation = c;
-        self.reset_chat_state();
-        self.persist();
+        self.undo_staged(
+            text,
+            staged,
+            Box::new(move |studio: &mut Studio| {
+                studio.flush_writes();
+                studio.reload_conversations();
+                if let Some(at) = pin {
+                    let pins = &mut studio.config.pinned_conversations;
+                    let at = at.min(pins.len());
+                    pins.insert(at, id.clone());
+                }
+                if was_open {
+                    studio.open_conversation(&id);
+                }
+            }),
+        );
+    }
+    /// Moves `items` (already staged in the trash) behind an undo toast: Undo restores them
+    /// and then runs `after`; otherwise they are deleted for good when the toast expires,
+    /// is dismissed or the app exits.
+    pub(super) fn undo_staged(
+        &mut self,
+        text: impl Into<String>,
+        items: Vec<trash::Staged>,
+        after: Box<dyn FnOnce(&mut Studio) + Send>,
+    ) {
+        let held = Arc::new(Mutex::new(Some(items)));
+        let for_undo = held.clone();
+        self.undo_toast(
+            text,
+            Box::new(move |studio: &mut Studio| {
+                let items = for_undo
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .unwrap_or_default();
+                let mut failed = None;
+                for item in items {
+                    if let Err(e) = item.restore() {
+                        failed = Some(e);
+                    }
+                }
+                match failed {
+                    Some(e) => studio.error = Some(format!("Could not restore: {e:#}")),
+                    None => after(studio),
+                }
+            }),
+            Box::new(move || {
+                let items = held
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .unwrap_or_default();
+                for item in items {
+                    let _ = item.commit();
+                }
+            }),
+        );
+    }
+    /// Re-reads the conversation list from disk (after a restore from the trash).
+    fn reload_conversations(&mut self) {
+        let dir = conversations_dir();
+        let (list, rebuilt) = list_conversations(&dir);
+        if rebuilt {
+            let _ = config::save_json_compact(&index_path(&dir), &list);
+        }
+        self.conversations = list;
     }
     fn check(&mut self) {
         if self.checking {
@@ -1839,8 +1926,10 @@ impl Studio {
         if manual {
             self.update_status = "Checking…".into();
         }
+        let channel = self.config.update_channel.clone();
         self.background(move || {
-            SystemEvent::UpdateChecked(update::check().map_err(|e| format!("{e:#}")), manual)
+            let result = update::check(&channel).map_err(|e| format!("{e:#}"));
+            SystemEvent::UpdateChecked(channel, result, manual)
         });
     }
     fn install_update(&mut self) {
@@ -2090,8 +2179,11 @@ impl Studio {
                         Err(e) => self.error = Some(format!("Automatic setup failed: {e}")),
                     }
                 }
-                SystemEvent::UpdateChecked(result, manual) => {
+                SystemEvent::UpdateChecked(channel, result, manual) => {
                     self.update_checking = false;
+                    if channel != self.config.update_channel {
+                        continue;
+                    }
                     match result {
                         Ok(Some(release)) => {
                             self.update_status =
@@ -2113,7 +2205,7 @@ impl Studio {
                         self.apply_update(path);
                     } else {
                         self.staged_update = Some(path);
-                        self.status = "Update ready, restarting after this reply".into();
+                        self.toast("Update ready, restarting after this reply");
                     }
                 }
                 SystemEvent::UpdateStaged(Err(e)) => {
@@ -2306,6 +2398,23 @@ impl Studio {
             self.draft.clear();
         }
     }
+    /// A character is selected (not "No character") and at least one exists.
+    fn character_selected(&self) -> bool {
+        self.config.use_character && !self.config.personas.is_empty()
+    }
+    /// The persona sent with a request: the selected character, or the empty default
+    /// (no name, no instructions) for "No character".
+    fn current_persona(&self) -> Persona {
+        if self.character_selected() {
+            self.config
+                .personas
+                .get(self.active_persona)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Persona::default()
+        }
+    }
     /// Starts a turn for `question`; false when it could not start.
     fn submit(&mut self, question: String) -> bool {
         if self.worker.is_some() {
@@ -2315,7 +2424,8 @@ impl Studio {
             self.error = Some("Finish the current review first".into());
             return false;
         }
-        if self.group_chat && !self.coding && !self.config.personas.iter().any(|p| p.in_group) {
+        let grouped = self.group_chat && !self.coding && self.character_selected();
+        if grouped && !self.config.personas.iter().any(|p| p.in_group) {
             self.error = Some("Create a character and include it in group chats first.".into());
             return false;
         }
@@ -2335,18 +2445,13 @@ impl Studio {
         self.cancel = Arc::new(AtomicBool::new(false));
         self.group_question = question.clone();
         self.round_follow = false;
-        self.pending_characters = if self.group_chat && !self.coding {
+        self.pending_characters = if grouped {
             crate::core::personas::group_order(&self.config.personas)
                 .into_iter()
                 .cloned()
                 .collect()
         } else {
-            self.config
-                .personas
-                .get(self.active_persona)
-                .cloned()
-                .into_iter()
-                .collect()
+            std::iter::once(self.current_persona()).collect()
         };
         let persona = self.pending_characters.pop_front().unwrap_or_default();
         self.start_character(question, persona, images, false);
@@ -2368,12 +2473,7 @@ impl Studio {
         self.conversation
             .messages
             .push(Message::new("You", "Continue."));
-        let persona = self
-            .config
-            .personas
-            .get(self.active_persona)
-            .cloned()
-            .unwrap_or_default();
+        let persona = self.current_persona();
         self.start_character("Continue.".into(), persona, vec![], true);
     }
     /// Replaces the replies to the last user message with new ones.
@@ -2764,137 +2864,142 @@ impl Studio {
             });
         ui.add_space(8.0);
     }
-    fn banners(&mut self, ui: &mut egui::Ui) {
-        if let Some(error) = self.error.clone() {
-            let mut dismiss = false;
-            Self::banner(ui, true, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(error);
-                    dismiss = ui.small_button("Dismiss").clicked();
-                });
-            });
-            if dismiss {
-                self.error = None;
-            }
-        }
-        if let Some(log) = self.llama_crash.clone() {
-            let (mut restart, mut dismiss) = (false, false);
-            Self::banner(ui, true, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("The model server stopped unexpectedly.").strong());
-                    restart = ui
-                        .add_enabled(!self.llama_busy, egui::Button::new("Restart"))
-                        .clicked();
-                    dismiss = ui.small_button("Dismiss").clicked();
-                });
-                if !log.trim().is_empty() {
-                    egui::CollapsingHeader::new(RichText::new("Server log").size(12.0))
-                        .id_salt("crash_log")
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(RichText::new(&log).monospace().size(11.5))
-                                    .selectable(true),
-                            );
-                        });
-                }
-            });
-            if restart {
-                self.start_llama();
-            }
-            if dismiss {
-                self.llama_crash = None;
-            }
-        }
-        if let Some(notice) = self.notice.clone() {
-            let mut dismiss = false;
-            Self::banner(ui, false, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(notice);
-                    dismiss = ui.small_button("Dismiss").clicked();
-                });
-            });
-            if dismiss {
-                self.notice = None;
-            }
-        }
-        if let Some(undo) = &self.undo {
-            let text = undo.text.clone();
-            let can_undo = undo.conversation.is_some() && self.worker.is_none();
-            let (mut restore, mut dismiss) = (false, false);
-            Self::banner(ui, false, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(text);
-                    if can_undo {
-                        restore = ui.small_button("Undo").clicked();
-                    }
-                    dismiss = ui.small_button("Dismiss").clicked();
-                });
-            });
-            if restore {
-                self.undo_delete();
-            } else if dismiss {
-                self.undo = None;
-            }
-        }
-        self.update_banner(ui);
-    }
-    fn update_banner(&mut self, ui: &mut egui::Ui) {
-        if let Some(progress) = &self.update_progress {
-            let p = progress.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            Self::banner(ui, false, |ui| {
-                ui.horizontal(|ui| {
-                    busy(ui);
-                    ui.label(if p.stage.is_empty() {
-                        "Downloading update…"
-                    } else {
-                        p.stage.as_str()
-                    });
-                });
-                if p.total > 0 {
-                    ui.add(
-                        egui::ProgressBar::new(p.done as f32 / p.total as f32)
-                            .text(format_mb(p.done, p.total)),
-                    );
-                }
-            });
+    /// The notices that stay until acted on, as cards floating at the top right (they never
+    /// push content): a stopped model server, update progress and an available update.
+    /// Short-lived messages go through `toast`, `error_toast` and `undo_toast` instead.
+    fn persistent_notices(&mut self, ctx: &egui::Context) {
+        let crash = self.llama_crash.clone();
+        let progress = self
+            .update_progress
+            .as_ref()
+            .map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        let release = self
+            .update
+            .clone()
+            .filter(|_| !self.update_hidden && progress.is_none());
+        if crash.is_none() && progress.is_none() && release.is_none() {
             return;
         }
-        let Some(release) = self.update.clone() else {
-            return;
-        };
-        if self.update_hidden {
-            return;
-        }
-        let (mut install, mut later) = (false, false);
+        let p = pal(ctx);
         let blocked = update::self_update_blocked();
-        Self::banner(ui, false, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("Update v{} available", release.version)).strong());
-                install = ui
-                    .add_enabled(
-                        self.worker.is_none() && blocked.is_none(),
-                        egui::Button::new("Install"),
-                    )
-                    .on_disabled_hover_text(
-                        blocked
-                            .clone()
-                            .unwrap_or_else(|| "Wait for the current reply to finish.".into()),
-                    )
-                    .clicked();
-                later = ui.small_button("Later").clicked();
-                let link = ui.hyperlink_to(
-                    "Release notes",
-                    format!(
-                        "https://github.com/{}/releases/tag/{}",
-                        update::REPO,
-                        release.tag
-                    ),
-                );
-                if !release.notes.trim().is_empty() {
-                    let _ = link.on_hover_text(release.notes.chars().take(800).collect::<String>());
+        let (mut restart, mut dismiss_crash, mut install, mut later) = (false, false, false, false);
+        let card = |danger: bool| {
+            egui::Frame::new()
+                .fill(if danger { p.danger_bg } else { p.card })
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if danger { p.danger_bg } else { p.border },
+                ))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+        };
+        let width = 340.0_f32.min(ctx.content_rect().width() - 32.0).max(160.0);
+        egui::Area::new(egui::Id::new("persistent_notices"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 56.0))
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                if let Some(log) = &crash {
+                    card(true).show(ui, |ui| {
+                        ui.set_width(width - 26.0);
+                        ui.visuals_mut().override_text_color = Some(p.danger_text);
+                        ui.label(
+                            RichText::new(icons::label(
+                                icons::WARNING,
+                                "The model server stopped unexpectedly.",
+                            ))
+                            .strong(),
+                        );
+                        ui.horizontal(|ui| {
+                            restart = ui
+                                .add_enabled(
+                                    !self.llama_busy,
+                                    egui::Button::new(icons::label(icons::REFRESH, "Restart")),
+                                )
+                                .clicked();
+                            dismiss_crash = ui
+                                .add(egui::Button::new(icons::label(icons::CLOSE, "Dismiss")))
+                                .clicked();
+                        });
+                        if !log.trim().is_empty() {
+                            egui::CollapsingHeader::new(RichText::new("Server log").size(12.0))
+                                .id_salt("crash_log")
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(log.as_str()).monospace().size(11.0),
+                                        )
+                                        .selectable(true),
+                                    );
+                                });
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+                if let Some(progress) = &progress {
+                    card(false).show(ui, |ui| {
+                        ui.set_width(width - 26.0);
+                        ui.horizontal(|ui| {
+                            busy(ui);
+                            ui.label(if progress.stage.is_empty() {
+                                "Downloading update…"
+                            } else {
+                                progress.stage.as_str()
+                            });
+                        });
+                        if progress.total > 0 {
+                            ui.add(
+                                egui::ProgressBar::new(
+                                    progress.done as f32 / progress.total as f32,
+                                )
+                                .text(format_mb(progress.done, progress.total)),
+                            );
+                        }
+                    });
+                }
+                if let Some(release) = &release {
+                    card(false).show(ui, |ui| {
+                        ui.set_width(width - 26.0);
+                        let title = if release.nightly {
+                            "New nightly build available".to_owned()
+                        } else {
+                            format!("Update v{} available", release.version)
+                        };
+                        ui.label(RichText::new(icons::label(icons::DOWNLOAD, &title)).strong());
+                        ui.horizontal_wrapped(|ui| {
+                            install = ui
+                                .add_enabled(
+                                    self.worker.is_none() && blocked.is_none(),
+                                    egui::Button::new("Install"),
+                                )
+                                .on_disabled_hover_text(blocked.clone().unwrap_or_else(|| {
+                                    "Wait for the current reply to finish.".into()
+                                }))
+                                .clicked();
+                            later = ui.button("Later").clicked();
+                            let link = ui.hyperlink_to(
+                                "Release notes",
+                                format!(
+                                    "https://github.com/{}/releases/tag/{}",
+                                    update::REPO,
+                                    release.tag
+                                ),
+                            );
+                            if !release.notes.trim().is_empty() {
+                                let _ = link.on_hover_text(
+                                    release.notes.chars().take(800).collect::<String>(),
+                                );
+                            }
+                        });
+                    });
                 }
             });
-        });
+        if restart {
+            self.start_llama();
+        }
+        if dismiss_crash {
+            self.llama_crash = None;
+        }
         if install {
             self.install_update();
         }
@@ -2919,7 +3024,9 @@ impl Studio {
             } else {
                 p.stage.as_str()
             });
-            cancel = ui.small_button("Cancel").clicked();
+            cancel = ui
+                .small_button(icons::label(icons::CLOSE, "Cancel"))
+                .clicked();
         });
         if p.total > 0 {
             let fraction = (p.done as f32 / p.total as f32).clamp(0.0, 1.0);
@@ -3038,18 +3145,19 @@ impl eframe::App for Studio {
                     .fill(p.bg)
                     .inner_margin(egui::Margin::symmetric(20, 14)),
             )
-            .show(ctx, |ui| {
-                self.banners(ui);
-                match self.view {
-                    0 => self.conversation_ui(ui),
-                    1 => self.library_page(ui),
-                    2 => self.connections_ui(ui),
-                    3 => self.settings_ui(ui),
-                    5 => self.models_page(ui),
-                    6 => self.workbench_page(ui),
-                    _ => self.characters_ui(ui),
-                }
+            .show(ctx, |ui| match self.view {
+                0 => self.conversation_ui(ui),
+                1 => self.library_page(ui),
+                2 => self.connections_ui(ui),
+                3 => self.settings_ui(ui),
+                5 => self.models_page(ui),
+                6 => self.workbench_page(ui),
+                _ => self.characters_ui(ui),
             });
+        if self.view != 3 {
+            // Left Settings: write any prompt edits still waiting on the debounce.
+            self.flush_agent(true);
+        }
         // After the pages and before the approval window, so the palette draws on top.
         self.quick_open(ctx);
         // Narrow windows: the context panel floats over the chat instead.
@@ -3141,6 +3249,15 @@ impl eframe::App for Studio {
             self.preview = None;
             self.preview_galley = None;
         }
+        self.persistent_notices(ctx);
+        // Messages other code left in `error` / `notice` become toasts.
+        if let Some(text) = self.error.take() {
+            self.error_toast(text);
+        }
+        if let Some(text) = self.notice.take() {
+            self.error_toast(text);
+        }
+        self.show_notices(ctx);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         for session in &self.discord_sessions {
@@ -3156,6 +3273,9 @@ impl eframe::App for Studio {
         crate::core::mcp::shutdown_all();
         self.cancel.store(true, Ordering::Relaxed);
         self.persist();
+        self.flush_agent(true);
+        // Pending undo toasts: the deletions they hold are carried out now.
+        self.flush_notices();
         // Let the writer finish every queued save before the process ends.
         self.writer = None;
         if let Some(handle) = self.writer_thread.take() {
@@ -3776,12 +3896,13 @@ fn render_blocks(
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.small_button("Copy").clicked() {
+                                    if ui.small_button(icons::label(icons::COPY, "Copy")).clicked()
+                                    {
                                         ui.ctx().copy_text(code.clone());
                                     }
                                     if apply
                                         && ui
-                                            .small_button("Apply")
+                                            .small_button(icons::label(icons::SAVE, "Apply"))
                                             .on_hover_text(
                                                 "Write this code to a workspace file, after review",
                                             )

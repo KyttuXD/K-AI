@@ -13,6 +13,8 @@ use std::{
 pub(super) const WORKBENCH_VIEW: usize = 6;
 /// Largest file the editor opens (tools::write accepts up to 128 KB).
 const EDIT_LIMIT: u64 = 128_000;
+/// Largest file whose bytes are held in memory so Undo can restore a discarded file.
+const UNDO_LIMIT: u64 = 8_000_000;
 /// Bytes of a diff or of terminal output drawn at once.
 const VIEW_LIMIT: usize = 200_000;
 const MAX_MATCHES: usize = 10_000;
@@ -39,24 +41,19 @@ enum GitMsg {
     Diff(String, bool, Result<String, String>),
     /// Result message, and whether files in the worktree may have changed.
     Done(Result<String, String>, bool),
+    /// A checkpoint restore: message and the id of the safety checkpoint that undoes it.
+    Restored(Result<(String, Option<String>), String>),
 }
 enum GitAct {
     Refresh,
+    Discard(String),
+    Restore(String, String),
     Select(String, bool),
     Stage(Vec<String>),
     Unstage(Vec<String>),
     Open(String),
     Checkpoint,
 }
-enum WbConfirm {
-    Discard(String),
-    /// Checkpoint id and label.
-    Restore(String, String),
-    /// Open another file over unsaved edits.
-    Open(String),
-    Reload,
-}
-
 /// Find-match byte ranges (start, end) in the editor text.
 type Spans = Arc<Vec<(usize, usize)>>;
 
@@ -110,7 +107,6 @@ pub struct WorkbenchState {
     label: String,
     pending: Vec<Receiver<GitMsg>>,
     last_refresh: Option<Instant>,
-    confirm: Option<WbConfirm>,
     editor: EditorState,
     files: Option<Vec<String>>,
     files_rx: Option<Receiver<Vec<String>>>,
@@ -205,6 +201,21 @@ impl WorkbenchState {
             .iter()
             .any(|s| s.running.load(Ordering::Relaxed))
     }
+}
+
+/// Restores a checkpoint; also returns the id of the checkpoint holding the state it replaced.
+fn restore_with_undo(
+    root: &Path,
+    id: &str,
+    label: &str,
+) -> anyhow::Result<(String, Option<String>)> {
+    git::restore_checkpoint(root, id)?;
+    let saved = format!("Before restoring checkpoint {id}");
+    let undo = git::checkpoints(root)
+        .ok()
+        .and_then(|list| list.into_iter().find(|(_, l)| *l == saved))
+        .map(|(n, _)| n);
+    Ok((format!("Restored \"{label}\""), undo))
 }
 
 fn snapshot(root: &Path) -> anyhow::Result<GitSnapshot> {
@@ -666,7 +677,6 @@ impl Studio {
             WbTab::Terminal => self.terminal_tab(ui),
         }
         let ctx = ui.ctx().clone();
-        self.confirm_dialog(&ctx);
         if self.workbench.busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else if self.workbench.any_running() {
@@ -766,11 +776,7 @@ impl Studio {
         if wb.editor.path == rel && wb.editor.root == self.config.workspace {
             return;
         }
-        if wb.editor.dirty() {
-            wb.confirm = Some(WbConfirm::Open(rel.to_owned()));
-            return;
-        }
-        self.load_editor(rel);
+        self.load_editor_keeping_edits(rel);
     }
 
     fn load_editor(&mut self, rel: &str) {
@@ -791,6 +797,84 @@ impl Studio {
             }
             Err(e) => self.error = Some(format!("Could not open {rel}: {e}")),
         }
+    }
+
+    /// Loads a file into the editor. Unsaved edits are dropped at once; an Undo toast puts them back.
+    fn load_editor_keeping_edits(&mut self, rel: &str) {
+        let ed = &self.workbench.editor;
+        let kept = ed.dirty().then(|| {
+            (
+                ed.root.clone(),
+                ed.path.clone(),
+                ed.text.clone(),
+                ed.saved.clone(),
+            )
+        });
+        self.load_editor(rel);
+        // A failed load leaves the edits in place and needs no undo.
+        let Some((root, path, text, saved)) = kept.filter(|_| !self.workbench.editor.dirty())
+        else {
+            return;
+        };
+        self.undo_toast(
+            format!("Discarded unsaved edits to {path}"),
+            Box::new(move |studio: &mut Studio| {
+                studio.view = WORKBENCH_VIEW;
+                studio.workbench.tab = WbTab::Editor;
+                studio.workbench.editor = EditorState {
+                    root,
+                    path,
+                    text,
+                    saved,
+                    ..Default::default()
+                };
+            }),
+            Box::new(|| {}),
+        );
+    }
+
+    /// Reverts one file at once. git::discard keeps a backup copy; the file's old bytes are also
+    /// held here so Undo can put them back.
+    fn discard_file(&mut self, path: String) {
+        let root = self.config.workspace.clone();
+        let previous = tools::resolve(&root, &path).ok().and_then(|full| {
+            let meta = std::fs::metadata(&full).ok()?;
+            (meta.is_file() && meta.len() <= UNDO_LIMIT)
+                .then(|| std::fs::read(&full).ok())
+                .flatten()
+        });
+        let kept = previous.is_some() || tools::resolve(&root, &path).is_ok_and(|f| !f.exists());
+        let name = path.clone();
+        self.workbench.git_op(true, {
+            let path = path.clone();
+            move |root| git::discard(root, &path).map(|_| format!("Discarded changes to {path}"))
+        });
+        if !kept {
+            self.toast(format!("Discarded {name}; a backup copy was kept"));
+            return;
+        }
+        self.undo_toast(
+            format!("Discarded changes to {name}"),
+            Box::new(move |studio: &mut Studio| {
+                let result = tools::resolve(&root, &path).and_then(|full| match previous {
+                    Some(bytes) => std::fs::write(&full, bytes).map_err(Into::into),
+                    None => std::fs::remove_file(&full).map_err(Into::into),
+                });
+                match result {
+                    Ok(()) => {
+                        studio.status = format!("Restored {path}");
+                        studio.workbench.refresh();
+                        studio.workbench.load_diff();
+                        let ed = &studio.workbench.editor;
+                        if ed.path == path && ed.root == root && !ed.dirty() {
+                            studio.load_editor(&path);
+                        }
+                    }
+                    Err(e) => studio.error_toast(format!("Could not undo: {e:#}")),
+                }
+            }),
+            Box::new(|| {}),
+        );
     }
 
     /// Resets per-workspace state when the workspace folder changes (terminals keep running).
@@ -827,6 +911,7 @@ impl Studio {
             Err(TryRecvError::Disconnected) => false,
         });
         let mut reload = false;
+        let mut undo_restores: Vec<(String, String)> = vec![];
         for msg in msgs {
             match msg {
                 GitMsg::Status(Ok(s)) => {
@@ -863,7 +948,33 @@ impl Studio {
                     wb.load_diff();
                     reload |= files_changed;
                 }
+                GitMsg::Restored(result) => {
+                    match result {
+                        Ok((m, undo)) => {
+                            if let Some(id) = undo {
+                                undo_restores.push((id, m.clone()));
+                            }
+                            self.status = m;
+                        }
+                        Err(e) => self.error = Some(format!("Git: {e}")),
+                    }
+                    wb.refresh();
+                    wb.load_diff();
+                    reload = true;
+                }
             }
+        }
+        for (id, message) in undo_restores {
+            self.undo_toast(
+                message,
+                Box::new(move |studio: &mut Studio| {
+                    studio.workbench.git_op(true, move |root| {
+                        git::restore_checkpoint(root, &id)
+                            .map(|_| "Restored the previous state".to_owned())
+                    });
+                }),
+                Box::new(|| {}),
+            );
         }
         let ed = &self.workbench.editor;
         if reload && !ed.path.is_empty() && !ed.dirty() && ed.root == self.config.workspace {
@@ -982,7 +1093,7 @@ impl Studio {
                                     .desired_width((ui.available_width() - 70.0).max(60.0)),
                             );
                             if ui
-                                .button("Create")
+                                .button(icons::label(icons::PLUS, "Create"))
                                 .on_hover_text(
                                     "Saves the working tree as a checkpoint without changing it",
                                 )
@@ -999,9 +1110,14 @@ impl Studio {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.small_button("Restore").clicked() {
-                                            wb.confirm =
-                                                Some(WbConfirm::Restore(id.clone(), label.clone()));
+                                        if ui
+                                            .small_button(icons::label(icons::UNDO, "Restore"))
+                                            .on_hover_text(
+                                                "Replaces the working tree; the current state is saved as a checkpoint first",
+                                            )
+                                            .clicked()
+                                        {
+                                            act = Some(GitAct::Restore(id.clone(), label.clone()));
                                         }
                                         ui.add(
                                             egui::Label::new(RichText::new(label).size(12.5))
@@ -1028,23 +1144,23 @@ impl Studio {
                     ui.add(egui::Label::new(RichText::new(&path).strong()).truncate());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if staged {
-                            if ui.button("Unstage").clicked() {
+                            if ui.button(icons::label(icons::UNDO, "Unstage")).clicked() {
                                 act = Some(GitAct::Unstage(vec![path.clone()]));
                             }
                         } else {
                             if ui
-                                .button("Discard")
-                                .on_hover_text("Reverts the file; a backup is kept")
+                                .button(icons::label(icons::TRASH, "Discard"))
+                                .on_hover_text("Reverts the file; Undo brings the changes back")
                                 .clicked()
                             {
-                                wb.confirm = Some(WbConfirm::Discard(path.clone()));
+                                act = Some(GitAct::Discard(path.clone()));
                             }
-                            if ui.button("Stage").clicked() {
+                            if ui.button(icons::label(icons::PLUS, "Stage")).clicked() {
                                 act = Some(GitAct::Stage(vec![path.clone()]));
                             }
                         }
                         if ui
-                            .button("Open")
+                            .button(icons::label(icons::EDITOR, "Open"))
                             .on_hover_text("Open in the editor")
                             .clicked()
                         {
@@ -1094,6 +1210,15 @@ impl Studio {
                 wb.label.clear();
                 wb.git_op(false, move |root| {
                     git::checkpoint(root, &label).map(|_| format!("Checkpoint \"{label}\" saved"))
+                });
+            }
+            Some(GitAct::Discard(path)) => self.discard_file(path),
+            Some(GitAct::Restore(id, label)) => {
+                let root = wb.root.clone();
+                wb.spawn(move || {
+                    GitMsg::Restored(
+                        restore_with_undo(&root, &id, &label).map_err(|e| e.to_string()),
+                    )
                 });
             }
             Some(GitAct::Open(path)) => self.open_in_editor(&path),
@@ -1405,12 +1530,8 @@ impl Studio {
             self.open_in_editor(&path);
         }
         if reload {
-            if self.workbench.editor.dirty() {
-                self.workbench.confirm = Some(WbConfirm::Reload);
-            } else {
-                let path = self.workbench.editor.path.clone();
-                self.load_editor(&path);
-            }
+            let path = self.workbench.editor.path.clone();
+            self.load_editor_keeping_edits(&path);
         }
         if save && self.workbench.editor.dirty() {
             self.save_editor();
@@ -1458,7 +1579,7 @@ impl Studio {
                 ui.horizontal(|ui| {
                     Self::eyebrow(ui, "TASKS");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("+ Add").clicked() {
+                        if ui.small_button(icons::label(icons::PLUS, "Add")).clicked() {
                             profiles.push(terminal::TaskProfile {
                                 name: format!("Task {}", profiles.len() + 1),
                                 program: String::new(),
@@ -1527,7 +1648,11 @@ impl Studio {
                     {
                         run = Some(i);
                     }
-                    if ui.button("Remove").clicked() {
+                    if ui
+                        .button(icons::label(icons::TRASH, "Remove"))
+                        .on_hover_text("Remove this task (Undo available)")
+                        .clicked()
+                    {
                         remove = Some(i);
                     }
                 });
@@ -1616,9 +1741,22 @@ impl Studio {
                         }
                     });
             });
-        if let Some(i) = remove {
-            self.config.task_profiles.remove(i);
+        if let Some(i) = remove
+            && i < self.config.task_profiles.len()
+        {
+            let profile = self.config.task_profiles.remove(i);
             self.workbench.profile = None;
+            self.persist();
+            let name = profile.name.clone();
+            self.undo_toast(
+                format!("Removed task {name}"),
+                Box::new(move |studio: &mut Studio| {
+                    let at = i.min(studio.config.task_profiles.len());
+                    studio.config.task_profiles.insert(at, profile);
+                    studio.persist();
+                }),
+                Box::new(|| {}),
+            );
         }
         if let Some(i) = close {
             let wb = &mut self.workbench;
@@ -1640,69 +1778,6 @@ impl Studio {
                     wb.active = wb.sessions.len() - 1;
                 }
                 Err(e) => self.error = Some(format!("Could not start {}: {e}", t.name)),
-            }
-        }
-    }
-
-    fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let wb = &self.workbench;
-        let Some(confirm) = &wb.confirm else { return };
-        let (title, detail, action) = match confirm {
-            WbConfirm::Discard(path) => (
-                "Discard changes?",
-                format!("{path} returns to its last committed state. A backup is kept."),
-                "Discard",
-            ),
-            WbConfirm::Restore(_, label) => (
-                "Restore checkpoint?",
-                format!(
-                    "The working tree is replaced by \"{label}\". The current state is saved as a checkpoint first."
-                ),
-                "Restore",
-            ),
-            WbConfirm::Open(_) | WbConfirm::Reload => (
-                "Discard unsaved edits?",
-                format!("{} has unsaved changes.", wb.editor.path),
-                "Discard",
-            ),
-        };
-        let mut decided = None;
-        let modal = egui::Modal::new(egui::Id::new("wb_confirm")).show(ctx, |ui| {
-            ui.set_max_width(380.0);
-            ui.label(RichText::new(title).size(16.0).strong());
-            ui.label(detail);
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    decided = Some(false);
-                }
-                if Self::primary(ui, action).clicked() {
-                    decided = Some(true);
-                }
-            });
-        });
-        if decided.is_none() && modal.should_close() {
-            decided = Some(false);
-        }
-        let Some(yes) = decided else { return };
-        let Some(confirm) = self.workbench.confirm.take() else {
-            return;
-        };
-        if !yes {
-            return;
-        }
-        let wb = &mut self.workbench;
-        match confirm {
-            WbConfirm::Discard(path) => wb.git_op(true, move |root| {
-                git::discard(root, &path).map(|_| format!("Discarded changes to {path}"))
-            }),
-            WbConfirm::Restore(id, label) => wb.git_op(true, move |root| {
-                git::restore_checkpoint(root, &id).map(|_| format!("Restored \"{label}\""))
-            }),
-            WbConfirm::Open(path) => self.load_editor(&path),
-            WbConfirm::Reload => {
-                let path = wb.editor.path.clone();
-                self.load_editor(&path);
             }
         }
     }

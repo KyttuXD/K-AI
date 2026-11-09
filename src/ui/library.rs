@@ -30,7 +30,6 @@ pub struct LibraryState {
     /// Supported file count per source id, filled by a background walk.
     counts: Arc<Mutex<HashMap<String, usize>>>,
     pending: Option<Pending>,
-    confirm_remove: Option<String>,
     import: Option<ImportJob>,
     query: String,
     pack: String,
@@ -192,22 +191,36 @@ impl Studio {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!running, egui::Button::new("Remove").small())
-                            .clicked()
-                        {
-                            action = Some(RowAction::Remove(s.id.clone()));
-                        }
-                        if ui
-                            .add_enabled(
-                                !running && s.enabled,
-                                egui::Button::new("Rebuild").small(),
-                            )
-                            .on_hover_text("Re-read every file of this source")
-                            .clicked()
-                        {
-                            action = Some(RowAction::Rebuild(s.id.clone()));
-                        }
+                        ui.add_enabled_ui(!running, |ui| {
+                            ui.menu_button(icons::MORE, |ui| {
+                                if ui
+                                    .add_enabled(
+                                        s.enabled,
+                                        egui::Button::new(icons::label(icons::REFRESH, "Rebuild")),
+                                    )
+                                    .on_hover_text("Re-read every file of this source")
+                                    .clicked()
+                                {
+                                    action = Some(RowAction::Rebuild(s.id.clone()));
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(icons::label(icons::TRASH, "Remove"))
+                                    .on_hover_text(match s.mode {
+                                        SourceMode::Imported => {
+                                            "Removes the imported copy (Undo available)"
+                                        }
+                                        SourceMode::Linked => "The original files are kept",
+                                    })
+                                    .clicked()
+                                {
+                                    action = Some(RowAction::Remove(s.id.clone()));
+                                    ui.close();
+                                }
+                            })
+                            .response
+                            .on_hover_text("More");
+                        });
                     });
                 });
                 let path = s.path.display().to_string();
@@ -229,7 +242,11 @@ impl Studio {
                 self.library.remove_source(&id);
                 self.library_state.rebuild_due = true;
             }
-            Some(RowAction::Remove(id)) => self.library_state.confirm_remove = Some(id),
+            Some(RowAction::Remove(id)) => {
+                if let Some(source) = self.config.doc_sources.iter().find(|s| s.id == id).cloned() {
+                    self.remove_doc_source(&source);
+                }
+            }
             None => {}
         }
     }
@@ -254,7 +271,7 @@ impl Studio {
                         ui.selectable_value(&mut st.pack, pack.clone(), pack);
                     }
                 });
-            run |= ui.button("Search").clicked();
+            run |= ui.button(icons::label(icons::SEARCH, "Search")).clicked();
         });
         if run {
             st.searched = true;
@@ -481,47 +498,6 @@ impl Studio {
                 self.add_doc_sources(pending);
             }
         }
-        let Some(id) = self.library_state.confirm_remove.clone() else {
-            return;
-        };
-        let Some(source) = self.config.doc_sources.iter().find(|s| s.id == id).cloned() else {
-            self.library_state.confirm_remove = None;
-            return;
-        };
-        let mut remove = None;
-        let modal = egui::Modal::new(egui::Id::new("library_remove")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.label(RichText::new(format!("Remove {}?", source.name)).strong());
-            ui.label(
-                RichText::new(match source.mode {
-                    SourceMode::Imported => "The imported copy is deleted.",
-                    SourceMode::Linked => "The original files are kept.",
-                })
-                .size(12.0)
-                .color(pl.muted),
-            );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let button = egui::Button::new(RichText::new("Remove").color(pl.danger_text))
-                    .fill(pl.danger_bg)
-                    .corner_radius(8);
-                if ui.add(button).clicked() {
-                    remove = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    remove = Some(false);
-                }
-            });
-        });
-        if remove.is_none() && modal.should_close() {
-            remove = Some(false);
-        }
-        if let Some(remove) = remove {
-            self.library_state.confirm_remove = None;
-            if remove {
-                self.remove_doc_source(&source);
-            }
-        }
     }
 
     fn add_doc_sources(&mut self, pending: Pending) {
@@ -555,16 +531,55 @@ impl Studio {
         self.persist();
     }
 
+    /// Removes a source at once. Imported copies are moved to the trash so Undo can bring
+    /// them back; they are really deleted when the toast expires.
     fn remove_doc_source(&mut self, source: &DocSource) {
+        let staged = if source.mode == SourceMode::Imported && source.path.exists() {
+            match crate::core::trash::stage(&source.path) {
+                Ok(staged) => Some(staged),
+                Err(e) => {
+                    self.error_toast(format!("Could not remove the imported copy: {e:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         self.library.remove_source(&source.id);
-        if source.mode == SourceMode::Imported
-            && let Err(e) = docs::delete_imported(source)
-        {
-            self.error = Some(format!("Could not delete the imported copy: {e:#}"));
-        }
+        let index = self
+            .config
+            .doc_sources
+            .iter()
+            .position(|s| s.id == source.id)
+            .unwrap_or(self.config.doc_sources.len());
         self.config.doc_sources.retain(|s| s.id != source.id);
         self.library_state.results.clear();
         self.persist();
+        let kept = source.clone();
+        let held = Arc::new(Mutex::new(staged));
+        let held_undo = held.clone();
+        self.undo_toast(
+            format!("Removed {}", source.name),
+            Box::new(move |studio: &mut Studio| {
+                let staged = held_undo.lock().unwrap().take();
+                if let Some(staged) = staged
+                    && let Err(e) = staged.restore()
+                {
+                    studio.error_toast(format!("Could not restore the imported copy: {e:#}"));
+                    return;
+                }
+                let at = index.min(studio.config.doc_sources.len());
+                studio.config.doc_sources.insert(at, kept);
+                studio.library_state.rebuild_due = true;
+                studio.persist();
+            }),
+            Box::new(move || {
+                let staged = held.lock().unwrap().take();
+                if let Some(staged) = staged {
+                    let _ = staged.commit();
+                }
+            }),
+        );
     }
 }
 

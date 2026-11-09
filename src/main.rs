@@ -9,6 +9,8 @@ use knowledge::docs;
 fn main() -> eframe::Result {
     core::diagnostics::install_panic_hook();
     core::update::cleanup_old();
+    // Files held for a last Undo in an earlier run are deleted for good.
+    core::trash::purge_old();
     let (config, notice) = config::Config::load_checked();
     // Logical points; the OS display scale multiplies these, so keep the
     // default small enough to fit a 1366x768 screen at 125%. Once the monitor

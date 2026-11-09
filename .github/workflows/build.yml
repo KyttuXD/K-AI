@@ -4,7 +4,9 @@ name: Build
 # native: tests on each system, in the ci profile (Cargo.toml). Pull requests test Windows, Linux x64 and Apple
 # Silicon and stop there; main and manual runs also test Linux ARM64 and Intel macOS, then build the package from the
 # same profile (the test build's dependencies are reused) with llama-server bundled, and upload it. Each job's summary
-# shows the test time and, when packaged, the binary and package sizes.
+# shows the test time and, when packaged, the binary and package sizes, then a table of how long each step took.
+# Pushes to main also publish the zips to the rolling "nightly" pre-release (scripts/nightly.sh), and publish-checksums
+# adds SHA256SUMS.txt and the "commit: <sha>" line the in-app updater reads. Pull requests never publish.
 # Rust caches are saved by main's runs only; pull requests read them (GitHub scopes caches by branch).
 on:
   push:
@@ -69,6 +71,10 @@ jobs:
 
   native:
     if: github.event_name != 'schedule'
+    # contents: write is for the nightly upload step below, which runs on pushes to main only (NIGHTLY). The token is
+    # handed to that step alone and checkout does not keep it; pull requests from forks only ever get read access.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -82,17 +88,29 @@ jobs:
       KYTTU_ARTIFACT: ${{ matrix.artifact }}
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
       PACKAGE: ${{ github.event_name != 'pull_request' }}
+      # Only a push to main publishes the rolling "nightly" pre-release (scripts/nightly.sh).
+      NIGHTLY: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     steps:
+      # Build-times table: each mark appends "name, cache hit, unix time" to times.tsv; the last step prints the gaps.
+      - name: Start timer
+        shell: bash
+        run: printf 'start\t\t%s\n' "$(date +%s)" > "$RUNNER_TEMP/times.tsv"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Rust toolchain
         shell: bash
-        run: rustup show active-toolchain || rustup toolchain install
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          printf 'Checkout and toolchain\t\t%s\n' "$(date +%s)" >> "$RUNNER_TEMP/times.tsv"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        id: rust-cache
         with:
           shared-key: ${{ matrix.artifact }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Mark Rust cache
+        shell: bash
+        run: printf 'Rust cache\t%s\t%s\n' '${{ steps.rust-cache.outputs.cache-hit }}' "$(date +%s)" >> "$RUNNER_TEMP/times.tsv"
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends cmake pkg-config libssl-dev libwayland-dev libxkbcommon-dev
@@ -102,14 +120,20 @@ jobs:
           start=$(date +%s)
           cargo test --locked --profile ci
           echo "TEST_SECONDS=$(($(date +%s) - start))" >> "$GITHUB_ENV"
+          printf 'Dependencies and tests\t\t%s\n' "$(date +%s)" >> "$RUNNER_TEMP/times.tsv"
 
       # Packaging (not on pull requests): llama-server is downloaded (or, for Intel macOS, built) once per llama.cpp
       # tag and kept in the Actions cache (the key hashes the fetch scripts, which pin the tag).
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: llama-cache
         if: env.PACKAGE == 'true'
         with:
           path: .llama/${{ matrix.artifact }}
           key: llama-${{ matrix.artifact }}-${{ hashFiles('scripts/fetch-llama.*') }}
+      - name: Mark llama cache
+        if: env.PACKAGE == 'true'
+        shell: bash
+        run: printf 'llama.cpp cache\t%s\t%s\n' '${{ steps.llama-cache.outputs.cache-hit }}' "$(date +%s)" >> "$RUNNER_TEMP/times.tsv"
       - name: Package Windows
         if: env.PACKAGE == 'true' && runner.os == 'Windows'
         shell: pwsh
@@ -132,6 +156,10 @@ jobs:
       - name: Zip package (Linux / macOS)
         if: env.PACKAGE == 'true' && runner.os != 'Windows'
         run: (cd dist && zip -qry "../kyttu-ai-${{ matrix.artifact }}.zip" .)
+      - name: Mark package
+        if: env.PACKAGE == 'true'
+        shell: bash
+        run: printf 'Package and zip\t\t%s\n' "$(date +%s)" >> "$RUNNER_TEMP/times.tsv"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: env.PACKAGE == 'true'
         with:
@@ -139,7 +167,63 @@ jobs:
           path: kyttu-ai-*.zip
           if-no-files-found: error
           retention-days: 14
+      # Nightly: the same zip under its rolling name. publish-checksums adds the checksums and the release body once
+      # all five are up. The in-app updater (channel "nightly") depends on this name.
+      - name: Publish nightly package
+        if: env.NIGHTLY == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p nightly
+          cp "kyttu-ai-${{ matrix.artifact }}.zip" "nightly/kyttu-ai-nightly-${{ matrix.artifact }}.zip"
+          bash scripts/nightly.sh "nightly/kyttu-ai-nightly-${{ matrix.artifact }}.zip"
+          printf 'Nightly upload\t\t%s\n' "$(date +%s)" >> "$RUNNER_TEMP/times.tsv"
       - name: Job summary
         if: always()
         shell: bash
-        run: bash scripts/package.sh --summary
+        run: |
+          bash scripts/package.sh --summary
+          if [[ -f "$RUNNER_TEMP/times.tsv" ]]; then
+            {
+              printf '\n#### Build times (%s)\n\n| Step | OS | Cache hit | Elapsed |\n|---|---|---|---|\n' "$KYTTU_ARTIFACT"
+              awk -F'\t' -v os="$RUNNER_OS" 'NR == 1 { prev = $3; next }
+                { hit = ($2 == "true" ? "yes" : ($2 == "false" ? "no" : "-"))
+                  printf "| %s | %s | %s | %d s |\n", $1, os, hit, $3 - prev; prev = $3 }' "$RUNNER_TEMP/times.tsv"
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+          fi
+
+  # Pushes to main only: SHA256SUMS.txt for the five nightly zips, and the release body ("commit: <sha>") that the
+  # in-app updater compares with its own build. Written last, so the body never points at files not yet uploaded.
+  publish-checksums:
+    needs: [native]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.native.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: kyttu-ai-*
+          merge-multiple: true
+          path: packages
+      - name: Checksums and release body
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd packages
+          [[ $(ls kyttu-ai-*.zip | wc -l) -eq 5 ]] || { echo "::error::expected 5 zip packages"; exit 1; }
+          for f in kyttu-ai-*.zip; do mv "$f" "kyttu-ai-nightly-${f#kyttu-ai-}"; done
+          sha256sum kyttu-ai-nightly-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+          bash scripts/nightly.sh --finalize packages/SHA256SUMS.txt
+          {
+            echo '### Nightly'
+            echo
+            echo "Published \`${GITHUB_SHA}\` to the [nightly release](https://github.com/${GITHUB_REPOSITORY}/releases/tag/nightly)."
+          } >> "$GITHUB_STEP_SUMMARY"

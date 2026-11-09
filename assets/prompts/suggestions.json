@@ -1,0 +1,14 @@
+{
+  "chat": [
+    { "title": "Explain a topic", "prompt": "Explain how a hash map works, with a small example." },
+    { "title": "Draft a message", "prompt": "Help me write a polite message asking for a deadline extension." },
+    { "title": "Brainstorm ideas", "prompt": "Give me ten ideas for a small weekend project." },
+    { "title": "Summarize text", "prompt": "Summarize the following text in five bullet points:\n\n" }
+  ],
+  "code": [
+    { "title": "Tour the project", "prompt": "Give me a short tour of this project: what it does and where the main code lives." },
+    { "title": "Find a bug", "prompt": "Look for likely bugs in the most recently changed files and explain each one." },
+    { "title": "Write tests", "prompt": "Suggest and write tests for the least covered module." },
+    { "title": "Explain a file", "prompt": "Explain what the main entry file does, step by step." }
+  ]
+}

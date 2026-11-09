@@ -1,7 +1,8 @@
+use super::icons;
 use super::*;
 use crate::core::{
     personas::{LoreEntry, MAX_LORE, MAX_LORE_TEXT, MAX_NOTE, MAX_NOTES},
-    secrets,
+    presets, secrets,
 };
 use crate::integrations::discord::{self, BotProfile, MemoryScope};
 use crate::integrations::discord_server;
@@ -38,6 +39,8 @@ struct ServerFiles {
 }
 
 const MAX_CHARACTER_FILE: u64 = 256_000;
+/// Most characters a settings file may hold (checked by `personas::validate`).
+const MAX_CHARACTERS: usize = 32;
 /// Seconds before an open bot card re-reads its server files.
 const SERVER_FILES_TTL: f64 = 5.0;
 
@@ -47,9 +50,21 @@ impl Studio {
         if self.config.personas.is_empty() {
             ui.label(RichText::new("No characters yet.").color(MUTED));
         }
+        if self.config.personas.is_empty() || !self.config.use_character {
+            ui.label(
+                RichText::new(
+                    "No character: the plain agent answers, with only its core rules. \
+                     Add a character and turn on \"Use a character\" to change that.",
+                )
+                .color(MUTED)
+                .size(12.0),
+            );
+        }
         ui.add_enabled_ui(self.worker.is_none(), |ui| {
+            let (mut add, mut del) = (None, None);
+            let (mut import, mut export_all, mut save) = (false, false, false);
             ui.horizontal(|ui| {
-                if Self::primary(ui, "+ New character").clicked() {
+                if Self::primary(ui, &icons::label(icons::PLUS, "New character")).clicked() {
                     let taken = taken_names(&self.config.personas);
                     self.config.personas.push(Persona {
                         name: unique_name(
@@ -60,50 +75,129 @@ impl Studio {
                     });
                     self.active_persona = self.config.personas.len() - 1;
                 }
-                if ui.button("Save").clicked() {
-                    match crate::core::personas::validate(&self.config.personas) {
-                        Ok(()) => {
-                            self.persist();
-                            self.status = "Characters saved".into();
-                        }
-                        Err(e) => self.error = Some(e.to_string()),
+                ui.menu_button(icons::label(icons::PLUS, "Add from preset…"), |ui| {
+                    ui.set_max_width(320.0);
+                    let list = presets::all();
+                    if list.is_empty() {
+                        ui.label(RichText::new("No presets.").color(MUTED).size(12.0));
                     }
-                }
-                if ui.button("Export all…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("characters.json")
-                        .save_file()
-                    && let Err(e) = write_json(&path, &self.config.personas)
-                {
-                    self.error = Some(e.to_string());
-                }
-                if ui
-                    .button("Import…")
-                    .on_hover_text("Adds the file's characters; clashing names get a number.")
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Characters", &["json"])
-                        .pick_file()
-                {
-                    match import_personas(&path, &self.config.personas) {
-                        Ok((merged, added)) => {
-                            self.config.personas = merged;
-                            self.persist();
-                            self.status = format!("Imported {added} character(s)");
+                    for preset in &list {
+                        ui.horizontal(|ui| {
+                            let button = ui.button(&preset.persona.name);
+                            if button.clicked() {
+                                add = Some(preset.persona.clone());
+                                ui.close();
+                            }
+                            if !preset.builtin
+                                && ui
+                                    .small_button(icons::TRASH)
+                                    .on_hover_text("Delete this preset")
+                                    .clicked()
+                            {
+                                del = Some((
+                                    preset.persona.name.clone(),
+                                    preset.persona.clone(),
+                                    preset.description.clone(),
+                                ));
+                                ui.close();
+                            }
+                        });
+                        if !preset.description.is_empty() {
+                            ui.label(RichText::new(&preset.description).color(MUTED).size(11.5));
                         }
-                        Err(e) => self.error = Some(e.to_string()),
                     }
+                })
+                .response
+                .on_hover_text("Adds a copy of a preset. Nothing is installed on its own.");
+                if ui.button(icons::label(icons::CHECK, "Save")).clicked() {
+                    save = true;
                 }
+                ui.menu_button(icons::MORE, |ui| {
+                    if ui.button(icons::label(icons::IMPORT, "Import…")).clicked() {
+                        import = true;
+                        ui.close();
+                    }
+                    if ui
+                        .button(icons::label(icons::EXPORT, "Export all…"))
+                        .clicked()
+                    {
+                        export_all = true;
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text("Import or export characters");
             });
+            if !self.config.personas.is_empty()
+                && ui
+                    .checkbox(&mut self.config.use_character, "Use a character")
+                    .on_hover_text("Off: chats are answered by the plain agent, with no character.")
+                    .changed()
+            {
+                self.persist();
+            }
+            if let Some(mut persona) = add {
+                if self.config.personas.len() >= MAX_CHARACTERS {
+                    self.error_toast(format!("Maximum {MAX_CHARACTERS} characters"));
+                } else {
+                    let taken = taken_names(&self.config.personas);
+                    persona.name = unique_name(&persona.name, &taken);
+                    let name = persona.name.clone();
+                    self.config.personas.push(persona);
+                    self.toast(format!("Added {name}"));
+                }
+            }
+            if let Some((name, persona, description)) = del {
+                match presets::delete_user(&name) {
+                    Ok(()) => self.undo_toast(
+                        format!("Deleted preset {name}"),
+                        Box::new(move |s: &mut Studio| {
+                            if let Err(e) = presets::save_user(&persona, &description) {
+                                s.error_toast(e.to_string());
+                            }
+                        }),
+                        Box::new(|| {}),
+                    ),
+                    Err(e) => self.error_toast(e.to_string()),
+                }
+            }
+            if save {
+                match crate::core::personas::validate(&self.config.personas) {
+                    Ok(()) => {
+                        self.persist();
+                        self.toast("Characters saved");
+                    }
+                    Err(e) => self.error_toast(e.to_string()),
+                }
+            }
+            if export_all
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("characters.json")
+                    .save_file()
+                && let Err(e) = write_json(&path, &self.config.personas)
+            {
+                self.error_toast(e.to_string());
+            }
+            if import
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Characters", &["json"])
+                    .pick_file()
+            {
+                match import_personas(&path, &self.config.personas) {
+                    Ok((merged, added)) => {
+                        self.config.personas = merged;
+                        self.persist();
+                        self.toast(format!("Imported {added} character(s)"));
+                    }
+                    Err(e) => self.error_toast(e.to_string()),
+                }
+            }
             ui.add_space(4.0);
-            let confirm_id = egui::Id::new("confirm_remove_persona");
-            let pending: Option<usize> = ui.data(|d| d.get_temp(confirm_id));
             egui::ScrollArea::vertical()
                 .id_salt("character_editor")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let (mut remove, mut export) = (None, None);
-                    let count = self.config.personas.len();
+                    let (mut remove, mut export, mut preset) = (None, None, None);
                     for (i, persona) in self.config.personas.iter_mut().enumerate() {
                         Self::card(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
@@ -183,26 +277,20 @@ impl Studio {
                                         .char_limit(1000),
                                 )
                                 .on_hover_text("Optional. Used by the Discord webhook.");
-                                if ui.button("Export…").clicked() {
-                                    export = Some(i);
-                                }
-                                if pending == Some(i) {
-                                    ui.label(
-                                        RichText::new(format!("Remove {}?", persona.name))
-                                            .color(ACCENT),
-                                    );
-                                    if ui.button("Yes, remove").clicked() {
-                                        remove = Some(i);
-                                        ui.data_mut(|d| d.remove::<usize>(confirm_id));
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        ui.data_mut(|d| d.remove::<usize>(confirm_id));
-                                    }
-                                } else if ui
-                                    .add_enabled(count > 1, egui::Button::new("Remove"))
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .button(icons::label(icons::SAVE, "Save as preset"))
+                                    .on_hover_text("Keeps a copy in the Add from preset menu.")
                                     .clicked()
                                 {
-                                    ui.data_mut(|d| d.insert_temp(confirm_id, i));
+                                    preset = Some(i);
+                                }
+                                if ui.button(icons::label(icons::EXPORT, "Export…")).clicked() {
+                                    export = Some(i);
+                                }
+                                if ui.button(icons::label(icons::TRASH, "Remove")).clicked() {
+                                    remove = Some(i);
                                 }
                             });
                         });
@@ -215,21 +303,51 @@ impl Studio {
                             .save_file()
                         && let Err(e) = write_json(&path, persona)
                     {
-                        self.error = Some(e.to_string());
+                        self.error_toast(e.to_string());
+                    }
+                    if let Some(i) = preset
+                        && let Some(persona) = self.config.personas.get(i)
+                    {
+                        let result = presets::save_user(persona, "");
+                        let text = format!("Saved {} as a preset", persona.name);
+                        match result {
+                            Ok(()) => self.toast(text),
+                            Err(e) => self.error_toast(e.to_string()),
+                        }
                     }
                     if let Some(i) = remove
                         && i < self.config.personas.len()
                     {
-                        self.config.personas.remove(i);
-                        if self.active_persona > i {
-                            self.active_persona -= 1;
-                        }
-                        self.active_persona = self
-                            .active_persona
-                            .min(self.config.personas.len().saturating_sub(1));
+                        self.remove_character(i);
                     }
                 });
         });
+    }
+
+    /// Removes character `i` at once; the toast's Undo puts it back where it was.
+    fn remove_character(&mut self, i: usize) {
+        let persona = self.config.personas.remove(i);
+        let previous_active = self.active_persona;
+        if self.active_persona > i {
+            self.active_persona -= 1;
+        }
+        self.active_persona = self
+            .active_persona
+            .min(self.config.personas.len().saturating_sub(1));
+        self.persist();
+        let text = format!("Removed {}", persona.name);
+        self.undo_toast(
+            text,
+            Box::new(move |s: &mut Studio| {
+                let mut persona = persona;
+                persona.name = unique_name(&persona.name, &taken_names(&s.config.personas));
+                let at = i.min(s.config.personas.len());
+                s.config.personas.insert(at, persona);
+                s.active_persona = previous_active.min(s.config.personas.len() - 1);
+                s.persist();
+            }),
+            Box::new(|| {}),
+        );
     }
 
     pub(super) fn connections_ui(&mut self, ui: &mut egui::Ui) {
@@ -262,7 +380,7 @@ impl Studio {
                     ui.add_space(8.0);
                 }
                 ui.horizontal(|ui| {
-                    if Self::primary(ui, "+ Add bot").clicked() {
+                    if Self::primary(ui, &icons::label(icons::PLUS, "Add bot")).clicked() {
                         let taken: HashSet<String> = self
                             .config
                             .discord_bots
@@ -366,8 +484,13 @@ impl Studio {
             .lock()
             .map(|s| s.clone())
             .unwrap_or_default();
-        let confirm_id = egui::Id::new("confirm_remove_bot");
-        let confirming = ui.data(|d| d.get_temp::<usize>(confirm_id)) == Some(i);
+        let available = if running {
+            self.discord_sessions[i].available_characters()
+        } else if self.config.discord_bots[i].no_character {
+            0
+        } else {
+            self.config.personas.iter().filter(|p| p.discord).count()
+        };
         // Keychain work runs after the card, with the bot's name at that moment.
         let mut forget = false;
         let mut server_op = None;
@@ -391,6 +514,16 @@ impl Studio {
                 });
                 ui.label(RichText::new(&status).color(ACCENT).size(12.0));
             });
+            let line = if bot.no_character {
+                "No character: answers as the plain agent".to_string()
+            } else if available == 0 {
+                "No characters available on Discord: answers as the plain agent".to_string()
+            } else if available == 1 {
+                "1 character available on Discord".to_string()
+            } else {
+                format!("{available} characters available on Discord")
+            };
+            ui.label(RichText::new(line).color(MUTED).size(12.0));
             ui.add_enabled_ui(!running, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.discord_tokens[i])
@@ -462,6 +595,10 @@ impl Studio {
                             .suffix(" s"),
                     );
                 });
+                ui.checkbox(&mut bot.no_character, "No character")
+                    .on_hover_text(
+                        "This bot always answers as the plain agent, even if characters are available on Discord.",
+                    );
                 ui.checkbox(&mut bot.group, "Group replies by default (up to 6 characters)");
                 ui.checkbox(&mut bot.docs, "Allow local documentation in replies");
                 if bot.docs {
@@ -496,18 +633,25 @@ impl Studio {
             server_op = bot_features(ui, i, bot, running);
             ui.horizontal(|ui| {
                 if running {
-                    if ui.button("Disconnect").clicked() {
+                    if ui
+                        .button(icons::label(icons::CLOSE, "Disconnect"))
+                        .clicked()
+                    {
                         action = Some(BotAction::Disconnect(i));
                     }
-                    if ui.button("Stop replies").clicked() {
+                    if ui
+                        .button(icons::label(icons::STOP, "Stop replies"))
+                        .clicked()
+                    {
                         self.discord_sessions[i].stop_replies();
                     }
-                } else if Self::primary(ui, "Connect").clicked() {
+                } else if Self::primary(ui, &icons::label(icons::CONNECTIONS, "Connect")).clicked()
+                {
                     action = Some(BotAction::Connect(i));
                 }
                 if !running
                     && ui
-                        .button("Clear credentials")
+                        .button(icons::label(icons::TRASH, "Clear credentials"))
                         .on_hover_text("Also deletes any saved in the keychain.")
                         .clicked()
                 {
@@ -515,24 +659,15 @@ impl Studio {
                     self.discord_webhooks[i].clear();
                     forget = bot.remember;
                 }
-                if confirming {
-                    ui.label(RichText::new("Remove this bot?").color(ACCENT));
-                    if ui
-                        .add_enabled(!running, egui::Button::new("Yes, remove"))
-                        .clicked()
-                    {
-                        action = Some(BotAction::Remove(i));
-                        ui.data_mut(|d| d.remove::<usize>(confirm_id));
-                    }
-                    if ui.button("Cancel").clicked() {
-                        ui.data_mut(|d| d.remove::<usize>(confirm_id));
-                    }
-                } else if ui
-                    .add_enabled(!running, egui::Button::new("Remove"))
+                if ui
+                    .add_enabled(
+                        !running,
+                        egui::Button::new(icons::label(icons::TRASH, "Remove")),
+                    )
                     .on_disabled_hover_text("Disconnect first")
                     .clicked()
                 {
-                    ui.data_mut(|d| d.insert_temp(confirm_id, i));
+                    action = Some(BotAction::Remove(i));
                 }
             });
         });
@@ -540,18 +675,18 @@ impl Studio {
             let name = self.config.discord_bots[i].name.clone();
             self.persist();
             if let Err(e) = forget_bot(&name) {
-                self.error = Some(e.to_string());
+                self.error_toast(e.to_string());
             }
         }
         if let Some(op) = server_op {
             let name = self.config.discord_bots[i].name.clone();
             match apply_server_op(&name, op) {
                 Ok(Some(done)) => {
-                    self.status = done;
+                    self.toast(done);
                     ui.data_mut(|d| d.remove::<ServerFiles>(server_files_id(i, &name)));
                 }
                 Ok(None) => {}
-                Err(e) => self.error = Some(e.to_string()),
+                Err(e) => self.error_toast(e.to_string()),
             }
         }
         action
@@ -571,15 +706,45 @@ impl Studio {
                     .is_some_and(|s| !s.running.load(Ordering::Relaxed));
                 if idle && i < self.config.discord_bots.len() {
                     let bot = self.config.discord_bots.remove(i);
-                    if bot.remember
-                        && let Err(e) = forget_bot(&bot.name)
-                    {
-                        self.error = Some(e.to_string());
-                    }
                     self.discord_sessions.remove(i);
-                    self.discord_tokens.remove(i);
-                    self.discord_webhooks.remove(i);
+                    let token = self.discord_tokens.remove(i);
+                    let hooks = self.discord_webhooks.remove(i);
                     self.persist();
+                    // Keychain entries are only deleted once the Undo window has passed.
+                    let (name, remember) = (bot.name.clone(), bot.remember);
+                    let text = format!("Removed bot {name}");
+                    if remember {
+                        pending_removals().push(name.clone());
+                    }
+                    let undo_name = name.clone();
+                    self.undo_toast(
+                        text,
+                        Box::new(move |s: &mut Studio| {
+                            let mut pending = pending_removals();
+                            if let Some(at) = pending.iter().position(|n| *n == undo_name) {
+                                pending.remove(at);
+                            }
+                            drop(pending);
+                            let at = i.min(s.config.discord_bots.len());
+                            s.config.discord_bots.insert(at, bot);
+                            s.discord_sessions
+                                .insert(i.min(s.discord_sessions.len()), Default::default());
+                            s.discord_tokens
+                                .insert(i.min(s.discord_tokens.len()), token);
+                            s.discord_webhooks
+                                .insert(i.min(s.discord_webhooks.len()), hooks);
+                            s.persist();
+                        }),
+                        Box::new(move || {
+                            if remember {
+                                let _ = forget_bot(&name);
+                                let mut pending = pending_removals();
+                                if let Some(at) = pending.iter().position(|n| *n == name) {
+                                    pending.remove(at);
+                                }
+                            }
+                        }),
+                    );
                 }
             }
             BotAction::Connect(i) => {
@@ -621,7 +786,7 @@ impl Studio {
                     Ok(())
                 })();
                 if let Err(e) = result {
-                    self.error = Some(e.to_string());
+                    self.error_toast(e.to_string());
                 }
             }
         }
@@ -762,7 +927,11 @@ fn bot_features(
                 for persona in characters {
                     ui.horizontal(|ui| {
                         ui.label(&persona.name);
-                        if ui.small_button("Export…").clicked() {
+                        if ui
+                            .small_button(icons::EXPORT)
+                            .on_hover_text("Export…")
+                            .clicked()
+                        {
                             op = Some(ServerOp::Export(persona.clone()));
                         }
                         if remove_button(ui, running) {
@@ -878,7 +1047,8 @@ fn tools_ui(ui: &mut egui::Ui, i: usize, bot: &mut BotProfile) {
 
 /// A small Remove button, disabled while the bot runs (it keeps its own copy of the files).
 fn remove_button(ui: &mut egui::Ui, running: bool) -> bool {
-    ui.add_enabled(!running, egui::Button::new("Remove").small())
+    ui.add_enabled(!running, egui::Button::new(icons::TRASH).small())
+        .on_hover_text("Remove")
         .on_disabled_hover_text("Disconnect first")
         .clicked()
 }
@@ -985,7 +1155,11 @@ fn lore_editor(ui: &mut egui::Ui, i: usize, lore: &mut Vec<LoreEntry>) {
     for (j, entry) in lore.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             key_list(ui, egui::Id::new(("lore_keys", i, j)), &mut entry.keys);
-            if ui.small_button("Remove").clicked() {
+            if ui
+                .small_button(icons::TRASH)
+                .on_hover_text("Remove")
+                .clicked()
+            {
                 remove = Some(j);
             }
         });
@@ -1001,7 +1175,7 @@ fn lore_editor(ui: &mut egui::Ui, i: usize, lore: &mut Vec<LoreEntry>) {
     if let Some(j) = remove {
         lore.remove(j);
     }
-    if lore.len() < MAX_LORE && ui.button("+ Entry").clicked() {
+    if lore.len() < MAX_LORE && ui.button(icons::label(icons::PLUS, "Entry")).clicked() {
         lore.push(LoreEntry::default());
     }
 }
@@ -1018,7 +1192,11 @@ fn notes_editor(ui: &mut egui::Ui, i: usize, notes: &mut Vec<String>) {
                     .desired_width((ui.available_width() - 70.0).max(120.0))
                     .char_limit(MAX_NOTE),
             );
-            if ui.small_button("Remove").clicked() {
+            if ui
+                .small_button(icons::TRASH)
+                .on_hover_text("Remove")
+                .clicked()
+            {
                 remove = Some(j);
             }
         });
@@ -1026,7 +1204,7 @@ fn notes_editor(ui: &mut egui::Ui, i: usize, notes: &mut Vec<String>) {
     if let Some(j) = remove {
         notes.remove(j);
     }
-    if notes.len() < MAX_NOTES && ui.button("+ Note").clicked() {
+    if notes.len() < MAX_NOTES && ui.button(icons::label(icons::PLUS, "Note")).clicked() {
         notes.push(String::new());
     }
 }
@@ -1143,9 +1321,19 @@ fn parse_webhooks(text: &str) -> anyhow::Result<HashMap<String, String>> {
     Ok(out)
 }
 
+/// Names of removed bots whose keychain entries are still waiting out the Undo window.
+fn pending_removals() -> std::sync::MutexGuard<'static, Vec<String>> {
+    static PENDING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Checks a bot before connecting: names must map to distinct memory folders.
 fn check_profile(profile: &BotProfile, all: &[BotProfile]) -> anyhow::Result<()> {
     anyhow::ensure!(!profile.name.trim().is_empty(), "Give the bot a name");
+    anyhow::ensure!(
+        !profile.remember || !pending_removals().contains(&profile.name),
+        "A bot with this name was just removed. Wait for Undo to expire or pick another name"
+    );
     let folder = discord::sanitize(&profile.name);
     anyhow::ensure!(
         all.iter()

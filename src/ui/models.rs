@@ -98,7 +98,6 @@ enum Action {
 pub struct ModelsState {
     installed: Vec<(PathBuf, u64)>,
     installed_at: Option<Instant>,
-    confirm_delete: Option<PathBuf>,
     recommended: Option<setup::RecommendedSettings>,
     /// File name whose preset is edited; empty = the active model.
     preset_for: String,
@@ -219,27 +218,35 @@ fn projector_name(base: &str, projector: &str) -> String {
     }
 }
 
-/// "Delete" with an inline "Delete? Yes / No" confirmation.
-fn delete_button(
-    ui: &mut egui::Ui,
-    confirm: &mut Option<PathBuf>,
-    path: &Path,
-    actions: &mut Vec<Action>,
-) {
-    if confirm.as_deref() == Some(path) {
-        ui.label(RichText::new("Delete?").color(pal(ui.ctx()).danger_text));
-        if ui.small_button("Yes").clicked() {
-            actions.push(Action::Delete(path.to_path_buf()));
-        }
-        if ui.small_button("No").clicked() {
-            *confirm = None;
-        }
-    } else if ui
-        .small_button("Delete")
-        .on_hover_text("Remove the file from disk")
+/// Delete button: acts at once; the Undo toast brings the file back.
+fn delete_button(ui: &mut egui::Ui, path: &Path, actions: &mut Vec<Action>) {
+    if ui
+        .small_button(icons::label(icons::TRASH, "Delete"))
+        .on_hover_text("Remove the file from disk (Undo available for a few seconds)")
         .clicked()
     {
-        *confirm = Some(path.to_path_buf());
+        actions.push(Action::Delete(path.to_path_buf()));
+    }
+}
+
+/// Deletes a projector that no remaining model in its folder still uses.
+fn remove_orphan_projector(projector: &Path) {
+    let Some(dir) = projector.parent() else {
+        return;
+    };
+    let used = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            !crate::core::llama::is_mmproj(p)
+                && p.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+        })
+        .any(|model| crate::core::llama::find_mmproj(&model).as_deref() == Some(projector));
+    if !used {
+        let _ = fs::remove_file(projector);
     }
 }
 
@@ -459,35 +466,113 @@ impl Studio {
         }
     }
 
+    /// Deletes a model file at once: the file (and its partial download) goes to the trash so
+    /// Undo can bring it back; the files are really deleted when the toast expires.
+    fn delete_model(&mut self, path: PathBuf) {
+        let root = setup::models_dir().canonicalize();
+        let target = path.canonicalize();
+        let inside = match (&root, &target) {
+            (Ok(root), Ok(target)) => {
+                target.starts_with(root) && target != root && target.is_file()
+            }
+            _ => false,
+        };
+        if !inside {
+            self.error_toast("Only models in the models folder can be deleted here");
+            return;
+        }
+        let projector = crate::core::llama::find_mmproj(&path);
+        let mut staged = Vec::new();
+        let mut part = path.clone().into_os_string();
+        part.push(".part");
+        let part = PathBuf::from(part);
+        for file in [path.clone(), part] {
+            if !file.exists() {
+                continue;
+            }
+            match crate::core::trash::stage(&file) {
+                Ok(s) => staged.push(s),
+                Err(e) => {
+                    for s in staged {
+                        let _ = s.restore();
+                    }
+                    self.error_toast(format!("Could not delete: {e:#}"));
+                    return;
+                }
+            }
+        }
+        let name = file_name(&path);
+        let old_preset = self.config.model_presets.remove(&name);
+        // A deleted projector falls back to the automatic pick.
+        let mut cleared = Vec::new();
+        for (key, preset) in self.config.model_presets.iter_mut() {
+            if preset.mmproj.as_ref() == Some(&path) {
+                preset.mmproj = None;
+                cleared.push(key.clone());
+            }
+        }
+        self.config
+            .model_presets
+            .retain(|_, p| *p != ModelPreset::default());
+        let was_model = self.config.gguf_model == path;
+        if was_model {
+            self.config.gguf_model = PathBuf::new();
+        }
+        let was_embed = self.config.embedding_gguf == path;
+        if was_embed {
+            self.config.embedding_gguf = PathBuf::new();
+        }
+        self.persist();
+        let held = Arc::new(Mutex::new(staged));
+        let held_undo = held.clone();
+        let undo_path = path.clone();
+        self.undo_toast(
+            format!("Deleted {}", short(&name, 40)),
+            Box::new(move |studio: &mut Studio| {
+                let staged = std::mem::take(&mut *held_undo.lock().unwrap());
+                for s in staged {
+                    if let Err(e) = s.restore() {
+                        studio.error_toast(format!("Could not restore: {e:#}"));
+                    }
+                }
+                if let Some(preset) = old_preset {
+                    studio
+                        .config
+                        .model_presets
+                        .insert(file_name(&undo_path), preset);
+                }
+                for key in cleared {
+                    studio.config.model_presets.entry(key).or_default().mmproj =
+                        Some(undo_path.clone());
+                }
+                if was_model {
+                    studio.config.gguf_model = undo_path.clone();
+                }
+                if was_embed {
+                    studio.config.embedding_gguf = undo_path;
+                }
+                studio.models_state.installed_at = None;
+                studio.persist();
+            }),
+            Box::new(move || {
+                let staged = std::mem::take(&mut *held.lock().unwrap());
+                for s in staged {
+                    let _ = s.commit();
+                }
+                if let Some(projector) = projector {
+                    remove_orphan_projector(&projector);
+                }
+            }),
+        );
+    }
+
     fn apply_action(&mut self, ctx: &egui::Context, action: Action) {
         let s = &mut self.models_state;
         match action {
             Action::Use(path) => self.use_model(path),
             Action::Delete(path) => {
-                s.confirm_delete = None;
                 s.installed_at = None;
-                match hub::delete(&path) {
-                    Ok(()) => {
-                        self.config.model_presets.remove(&file_name(&path));
-                        // A deleted projector falls back to the automatic pick.
-                        for preset in self.config.model_presets.values_mut() {
-                            if preset.mmproj.as_ref() == Some(&path) {
-                                preset.mmproj = None;
-                            }
-                        }
-                        self.config
-                            .model_presets
-                            .retain(|_, p| *p != ModelPreset::default());
-                        if self.config.gguf_model == path {
-                            self.config.gguf_model = PathBuf::new();
-                        }
-                        if self.config.embedding_gguf == path {
-                            self.config.embedding_gguf = PathBuf::new();
-                        }
-                        self.persist();
-                    }
-                    Err(e) => self.error = Some(format!("Could not delete: {e:#}")),
-                }
+                self.delete_model(path);
             }
             Action::Download {
                 fetch,
@@ -748,7 +833,7 @@ impl Studio {
                                 running && (is_active || active_projector.as_ref() == Some(path));
                             let deletable = path.starts_with(&models_dir) && !in_use;
                             if deletable {
-                                delete_button(ui, &mut s.confirm_delete, path, actions);
+                                delete_button(ui, path, actions);
                             }
                         });
                         ui.end_row();
@@ -1259,7 +1344,7 @@ impl Studio {
                             }
                             // Ollama models are removed with Ollama; the served file stays.
                             if !ollama && !(active && running) {
-                                delete_button(ui, &mut s.confirm_delete, &path, actions);
+                                delete_button(ui, &path, actions);
                             }
                         });
                         ui.end_row();

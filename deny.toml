@@ -24,6 +24,10 @@ ignore = [
     { id = "RUSTSEC-2026-0208", reason = "libcrux-sha3 pinned by hpke-rs via songbird DAVE; AVX2 x4 shake256 unused" },
     # Drop when songbird allows ringbuf >= 0.5.2.
     { id = "RUSTSEC-2026-0293", reason = "songbird 0.6.1 needs ringbuf ^0.4; buffered samples have no panicking Drop" },
+    # Drop when hpke-rs-rust-crypto (via songbird's DAVE support) allows crypto-bigint >= 0.7.6.
+    { id = "RUSTSEC-2026-0212", reason = "crypto-bigint 0.5.5 pinned via hpke-rs-rust-crypto for DAVE voice key agreement; the aarch64 constant-time swap issue is local timing only, with no remote secret oracle" },
+    # Drop when the voice stack allows libcrux-secrets >= 0.0.6.
+    { id = "RUSTSEC-2026-0387", reason = "libcrux-secrets 0.0.5 pinned via hpke-rs for DAVE voice encryption; timing variability needs local measurement, no remote secret oracle in this app" },
 ]
 
 [licenses]

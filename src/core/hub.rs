@@ -257,6 +257,7 @@ fn installed_gguf() -> Vec<(PathBuf, u64)> {
 
 /// Deletes a downloaded model (and its partial download). Refuses anything
 /// outside the models folder.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn delete(path: &Path) -> Result<()> {
     let root = setup::models_dir()
         .canonicalize()
@@ -281,6 +282,7 @@ pub fn delete(path: &Path) -> Result<()> {
 }
 
 /// Deletes a projector that no remaining model in its folder still uses.
+#[cfg_attr(not(test), allow(dead_code))]
 fn remove_orphan_projector(projector: &Path) {
     let Some(dir) = projector.parent() else {
         return;

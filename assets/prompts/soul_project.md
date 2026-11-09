@@ -1,0 +1,2 @@
+Project rules:
+{{project}}
