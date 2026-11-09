@@ -491,13 +491,13 @@ impl Studio {
         } else {
             self.config.personas.iter().filter(|p| p.discord).count()
         };
-        // Keychain work runs after the card, with the bot's name at that moment.
+        // Saved-file work runs after the card, with the bot's name at that moment.
         let mut forget = false;
         let mut server_op = None;
         Self::card(ui, |ui| {
             let bot = &mut self.config.discord_bots[i];
             ui.horizontal(|ui| {
-                // Keychain entries are keyed by the name, so it is fixed while they are kept.
+                // Saved entries are keyed by the name, so it is fixed while they are kept.
                 let remember = bot.remember;
                 ui.add_enabled(
                     !running && !remember,
@@ -529,17 +529,20 @@ impl Studio {
                     egui::TextEdit::singleline(&mut self.discord_tokens[i])
                         .password(true)
                         .desired_width(f32::INFINITY)
-                        .hint_text(if bot.remember {
-                            "Bot token (blank = use the saved one)"
-                        } else {
+                        .hint_text(if !bot.remember {
                             "Bot token (kept in memory only)"
+                        } else if saved_token_exists(ui, &bot.name) {
+                            "Saved on this computer (blank = use it)"
+                        } else {
+                            "Bot token (blank = use the saved one)"
                         }),
                 );
                 if ui
-                    .checkbox(&mut bot.remember, "Remember in system keychain")
+                    .checkbox(&mut bot.remember, "Remember on this computer")
                     .on_hover_text(
-                        "Saves the token and webhooks in the OS keychain on Connect, never in \
-                         settings. Turning this off deletes them.",
+                        "Saves the token and webhooks on Connect in a private file in the app \
+                         data folder (\".env\"), never in settings or exports. Turning this off \
+                         deletes them.",
                     )
                     .changed()
                     && !bot.remember
@@ -652,7 +655,7 @@ impl Studio {
                 if !running
                     && ui
                         .button(icons::label(icons::TRASH, "Clear credentials"))
-                        .on_hover_text("Also deletes any saved in the keychain.")
+                        .on_hover_text("Also deletes any saved on this computer (the .env file).")
                         .clicked()
                 {
                     self.discord_tokens[i].clear();
@@ -710,7 +713,7 @@ impl Studio {
                     let token = self.discord_tokens.remove(i);
                     let hooks = self.discord_webhooks.remove(i);
                     self.persist();
-                    // Keychain entries are only deleted once the Undo window has passed.
+                    // Saved entries (.env) are only deleted once the Undo window has passed.
                     let (name, remember) = (bot.name.clone(), bot.remember);
                     let text = format!("Removed bot {name}");
                     if remember {
@@ -756,7 +759,7 @@ impl Studio {
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("Unknown bot"))?;
                     check_profile(&profile, &self.config.discord_bots)?;
-                    // Blank fields fall back to what the keychain holds for this bot.
+                    // Blank fields fall back to what is saved on this computer for this bot.
                     let (typed_token, typed_hooks) =
                         (&self.discord_tokens[i], &self.discord_webhooks[i]);
                     let saved = |typed: &str, key: String| {
@@ -780,7 +783,7 @@ impl Studio {
                     )?;
                     if profile.remember {
                         remember_bot(&profile.name, &typed_token, &typed_hooks).map_err(|e| {
-                            anyhow::anyhow!("Connected, but the keychain failed: {e}")
+                            anyhow::anyhow!("Connected, but saving on this computer failed: {e}")
                         })?;
                     }
                     Ok(())
@@ -1244,8 +1247,24 @@ fn parse_keys(text: &str) -> Vec<String> {
     out
 }
 
-/// Saves a bot's typed token and webhook lines in the keychain (blank fields are left as they
-/// are, since blank means "use the saved value").
+/// Whether a token is saved for this bot. The answer is cached in egui memory for a couple of
+/// seconds so the file is not read every frame; the token itself is never kept.
+fn saved_token_exists(ui: &egui::Ui, name: &str) -> bool {
+    use std::time::{Duration, Instant};
+    let id = egui::Id::new(("saved_token", name));
+    if let Some((at, found)) = ui.data(|d| d.get_temp::<(Instant, bool)>(id))
+        && at.elapsed() < Duration::from_secs(2)
+    {
+        return found;
+    }
+    let found = !name.trim().is_empty()
+        && secrets::get(&discord::token_key(name)).is_some_and(|t| !t.trim().is_empty());
+    ui.data_mut(|d| d.insert_temp(id, (Instant::now(), found)));
+    found
+}
+
+/// Saves a bot's typed token and webhook lines in the private .env file (blank fields are left
+/// as they are, since blank means "use the saved value").
 fn remember_bot(name: &str, token: &str, webhooks: &str) -> anyhow::Result<()> {
     if !token.trim().is_empty() {
         secrets::set(&discord::token_key(name), token.trim())?;
@@ -1257,8 +1276,10 @@ fn remember_bot(name: &str, token: &str, webhooks: &str) -> anyhow::Result<()> {
 }
 
 fn forget_bot(name: &str) -> anyhow::Result<()> {
-    secrets::delete(&discord::token_key(name))?;
-    secrets::delete(&discord::webhooks_key(name))
+    // Try both deletes even when the first fails.
+    let token = secrets::delete(&discord::token_key(name));
+    let hooks = secrets::delete(&discord::webhooks_key(name));
+    token.and(hooks)
 }
 
 fn scope_label(scope: &MemoryScope) -> &'static str {
@@ -1321,7 +1342,7 @@ fn parse_webhooks(text: &str) -> anyhow::Result<HashMap<String, String>> {
     Ok(out)
 }
 
-/// Names of removed bots whose keychain entries are still waiting out the Undo window.
+/// Names of removed bots whose saved .env entries are still waiting out the Undo window.
 fn pending_removals() -> std::sync::MutexGuard<'static, Vec<String>> {
     static PENDING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     PENDING.lock().unwrap_or_else(|e| e.into_inner())
