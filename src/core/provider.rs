@@ -542,15 +542,20 @@ fn parse_arguments(raw: &str) -> Value {
 /// Recovers tool calls a model wrote into its reply text, inside `<tool_call>` tags or as a
 /// bare JSON object or array. Returns the remaining text and the calls found.
 fn text_tool_calls(content: &str, definitions: &Value) -> (String, Vec<Value>) {
-    const OPEN: &str = "<tool_call>";
-    const CLOSE: &str = "</tool_call>";
-    if content.contains(OPEN) {
+    // Models wrap a call in different tags: Qwen2.5 Coder writes <tools>, others <tool_call>.
+    const TAGS: [(&str, &str); 4] = [
+        ("<tool_call>", "</tool_call>"),
+        ("<tools>", "</tools>"),
+        ("<tool>", "</tool>"),
+        ("<function_call>", "</function_call>"),
+    ];
+    if let Some(&(open, close)) = TAGS.iter().find(|(open, _)| content.contains(open)) {
         let (mut rest, mut found, mut tail) = (String::new(), vec![], content);
-        while let Some(start) = tail.find(OPEN) {
+        while let Some(start) = tail.find(open) {
             rest.push_str(&tail[..start]);
-            let after = &tail[start + OPEN.len()..];
-            let (body, next) = match after.find(CLOSE) {
-                Some(end) => (&after[..end], &after[end + CLOSE.len()..]),
+            let after = &tail[start + open.len()..];
+            let (body, next) = match after.find(close) {
+                Some(end) => (&after[..end], &after[end + close.len()..]),
                 None => (after, ""),
             };
             found.extend(json_calls(body, None));
@@ -751,6 +756,22 @@ mod tests {
         assert_eq!(rest, answer);
         let web = r#"{"name":"web_search","arguments":{"query":"x"}}"#;
         assert!(text_tool_calls(web, &defs).1.is_empty());
+    }
+    #[test]
+    fn recovers_a_call_in_tools_tags() {
+        let defs = tools::definitions(&tools::ToolSet {
+            docs: false,
+            web: false,
+        });
+        // The reply Qwen2.5-Coder-7B-Instruct gave through llama-server b12110 (no tool_calls).
+        let reply = "To identify potential bugs, I'll first list the files in the workspace.\n\n<tools>\n{\"name\": \"list_files\", \"arguments\": {}}\n</tools>";
+        let (rest, calls) = text_tool_calls(reply, &defs);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "list_files");
+        assert_eq!(
+            rest,
+            "To identify potential bugs, I'll first list the files in the workspace."
+        );
     }
     #[test]
     fn recovers_a_fenced_call_inside_prose() {
